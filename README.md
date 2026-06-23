@@ -283,4 +283,4 @@ AeroBBS/
 
 ## License
 
-LGPL-3.0-or-later. See `neoforge.mods.toml` for the mod loader declaration.
+MIT License
