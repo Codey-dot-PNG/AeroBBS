@@ -1,0 +1,11 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.aeronauticscml.bridge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "refmap": "aeronauticscml.refmap.json",
+  "target": "@env(DEFAULT)",
+  "client": [
+    "FormPropertiesMixin"
+  ]
+}

@@ -1,0 +1,8 @@
+Manifest-Version: 1.0
+Specification-Title: aeronauticscml
+Specification-Vendor: aeronauticscml
+Specification-Version: 1
+Implementation-Title: aeronautics-cml-bridge
+Implementation-Version: 1.21.1-0.2.0
+Implementation-Vendor: aeronauticscml
+

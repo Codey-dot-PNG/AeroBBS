@@ -1,0 +1,6 @@
+{
+  "command.aeronauticscml.started": "Started recording %s ships.",
+  "command.aeronauticscml.stopped": "Stopped recording. Captured %s frames across %s ships.",
+  "command.aeronauticscml.status": "Recording: %s | Active ships: %s | Total frames: %s",
+  "command.aeronauticscml.no_recording": "No active recording session."
+}
