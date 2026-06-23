@@ -283,4 +283,7 @@ AeroBBS/
 
 ## License
 
-MIT license
+AeroBBS is shared under the MIT License.
+See LICENSE for details.
+
+Copyright © 2026 Codey-dot-PNG
