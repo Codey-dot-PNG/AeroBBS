@@ -1,5 +1,8 @@
 # AeroBBS — Aeronautics CML Bridge
 
+Disclosure: This mod was primarily AI generated, I'm sorry :(
+It was specifically made for my WIP animated series, so I will most likely not be supporting or maintaining it. Feel free to fork and modify to your hearts content tho!
+
 A NeoForge 1.21.1 mod that bridges **Sable's Physics Pipeline (SPP)** / **Create Aeronautics** ship movements into **BBS CML Edition** recordings, so BBS CML can capture ship motion frame-by-frame and replay ships visually inside the BBS CML cinematic editor.
 
 > Repository name: `AeroBBS`. Mod ID: `aeronauticscml`. Built artifact: `aeronautics-cml-bridge-1.21.1-0.2.0.jar`.
@@ -10,7 +13,7 @@ A NeoForge 1.21.1 mod that bridges **Sable's Physics Pipeline (SPP)** / **Create
 
 | Mod | Loader | Mod ID |
 |-----|--------|--------|
-| Sable (SPP) 2.0.3 | **NeoForge** 21.1.77+ | `sable` |
+| Sable (SPP) 2.0.3 | **NeoForge** 21.1.228 | `sable` |
 | Create Aeronautics 1.3.0 (bundled) | **NeoForge** (lowcode) | `aeronautics_bundled` |
 | BBS CML Edition 1.10.3 | **Fabric** (Fabric Loader 0.16.14+, Fabric API) | `bbs` |
 
