@@ -48,7 +48,6 @@ This is an alternative quaternion-based path. `RealCmlRecorder` does **not** pop
 ## What the bridge does NOT do (yet)
 
 - **Material/Block-entity state in replays.** Ship blocks are captured as a vanilla `StructureTemplate` (.nbt) snapshot taken at recording start. Block-entity state (signs, fluid tanks, Create contraption internals) is not re-sampled mid-recording, so changes to those during the recording will not be reflected in the replay.
-- **Sound/event capture.** Only pose and structure are recorded; sounds, particle events, and chat are not.
 
 ---
 
