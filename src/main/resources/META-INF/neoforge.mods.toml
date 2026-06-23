@@ -1,12 +1,12 @@
 modLoader="javafml"
 loaderVersion="[4,)"
-license="LGPL-3.0"
+license="MIT"
 
 [[mods]]
 modId="aeronauticscml"
 version="${file.jarVersion}"
 displayName="Aeronautics CML Bridge"
-authors="Your Name"
+authors="Codey"
 description='''
 Bridges Sable's Physics Pipeline (SPP) ships / Create Aeronautics contraptions
 into BBS CML Edition recordings so that BBS CML can capture ship movements
@@ -35,7 +35,7 @@ ordering="AFTER"
 side="BOTH"
 mandatory=false
 
-# BBS CML Edition (mod ID is "bbs" not "bbscml")
+# BBS CML Edition
 [[dependencies.aeronauticscml]]
 modId="bbs"
 type="optional"
