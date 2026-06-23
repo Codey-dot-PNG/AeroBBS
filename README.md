@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Aeronautics CML Bridge
 
 A NeoForge 1.21.1 mod that bridges **Sable's Physics Pipeline (SPP)** / **Create Aeronautics** ship movements into **BBS CML Edition** recordings, so BBS CML can capture ship motion frame-by-frame.
@@ -141,3 +142,7 @@ fallbackOutputDir = "aeronauticscml_recordings"
 ## License
 
 LGPL-3.0-or-later.
+=======
+# AeroBBS
+A BBS CML addon that allows BBS recordings of Sable sublevels
+>>>>>>> 39b57b088a61a5bdcab757e309f273dee52204db
