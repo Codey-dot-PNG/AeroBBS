@@ -283,4 +283,4 @@ AeroBBS/
 
 ## License
 
-MIT License
+MIT license
