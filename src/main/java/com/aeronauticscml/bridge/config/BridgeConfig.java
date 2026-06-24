@@ -31,7 +31,12 @@ public final class BridgeConfig {
                         ArrayList::new,
                         o -> o instanceof String);
         this.recordIntervalTicks = b
-                .comment("Ticks between captured frames. 1 = 20 Hz. 5 = 4 Hz (lighter load).")
+                .comment("Ticks between captured frames. 1 = 20 Hz (per-tick keyframes).",
+                        "MUST be 1 for correct rotation playback at 1x speed — BBS CML does",
+                        "per-component Euler lerp between Transform keyframes (no slerp),",
+                        "so any gap larger than 1 tick causes gimbal-lock artifacts at",
+                        "pitch +/-90 degrees. Increase only if you accept broken rotations",
+                        "for a lighter capture load.")
                 .defineInRange("recordIntervalTicks", 1, 1, 100);
         this.captureVelocity = b
                 .comment("Include linear + angular velocity in each frame.")

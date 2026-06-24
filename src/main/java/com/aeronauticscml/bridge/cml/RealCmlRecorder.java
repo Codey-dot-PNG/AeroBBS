@@ -17,6 +17,7 @@ import mchorse.bbs_mod.resources.Link;
 import mchorse.bbs_mod.utils.keyframes.KeyframeChannel;
 import mchorse.bbs_mod.utils.pose.Transform;
 
+import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.io.File;
@@ -41,14 +42,13 @@ public final class RealCmlRecorder implements ICmlRecorder {
     private final Map<UUID, Replay> replayPerShip = new HashMap<>();
     private final Map<UUID, StructureForm> formPerShip = new HashMap<>();
     private final Map<UUID, Path> structureFilePerShip = new HashMap<>();
-    private final Map<UUID, Vector3f> prevEulerPerShip = new HashMap<>();
     private final StructureSnapshotService snapshotService = new StructureSnapshotService();
 
     private Film film;
     private String currentFilmName;
     private boolean recording;
     private long totalFrames;
-    private int firstTick = Integer.MIN_VALUE;
+    private long firstTick = Long.MIN_VALUE;
     private int debugCounter;
 
     @Override
@@ -75,9 +75,8 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 replayPerShip.clear();
                 formPerShip.clear();
                 structureFilePerShip.clear();
-                prevEulerPerShip.clear();
                 debugCounter = 0;
-                firstTick = Integer.MIN_VALUE;
+                firstTick = Long.MIN_VALUE;
                 recording = true;
                 AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] CML recording session started. Film='{}'", currentFilmName);
             } catch (Throwable t) {
@@ -94,8 +93,8 @@ public final class RealCmlRecorder implements ICmlRecorder {
         synchronized (lock) {
             if (!recording || film == null) return;
             try {
-                if (firstTick == Integer.MIN_VALUE) firstTick = (int) pose.tick();
-                int relativeTick = (int) (pose.tick() - firstTick);
+                if (firstTick == Long.MIN_VALUE) firstTick = pose.tick();
+                long relativeTick = pose.tick() - firstTick;
 
                 Replay replay = replayPerShip.get(pose.shipId());
                 if (replay == null) {
@@ -116,42 +115,40 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 }
 
                 // Position (entity-level, works for StructureForm)
-                replay.keyframes.x.insert(relativeTick, pose.worldPosition().x);
-                replay.keyframes.y.insert(relativeTick, pose.worldPosition().y);
-                replay.keyframes.z.insert(relativeTick, pose.worldPosition().z);
+                float tickF = (float) relativeTick;
+                replay.keyframes.x.insert(tickF, pose.worldPosition().x);
+                replay.keyframes.y.insert(tickF, pose.worldPosition().y);
+                replay.keyframes.z.insert(tickF, pose.worldPosition().z);
 
-                // Decompose the ship quaternion to Euler angles and store on the
-                // form-level Transform via the "transform" property channel.
-                // Transform.rotate stores radians — JOML's rotateZ/Y/X and
-                // Axis.rotation all expect radians. The non-colon "transform"
-                // key does absolute setRuntimeValue (confirmed by bytecode),
-                // so NO rotation compounding occurs.
-                // We unwrap each angle against the previous frame to prevent
-                // sign flips at the ±π boundary from causing the linear
-                // interpolation to rotate the wrong way during playback.
+                // Decompose the ship quaternion to ZYX Euler angles and store on
+                // the form-level Transform via the "transform" property channel.
+                //
+                // IMPORTANT — why we do NOT unwrap Euler angles here:
+                // BBS CML's TransformKeyframeFactory.interpolate() calls Transform.lerp(),
+                // which does per-component linear interpolation of the Euler triple
+                // (confirmed by disassembling Lerps.class — there is no slerp in BBS CML).
+                // Per-axis unwrapping cannot fix gimbal lock: at the asin singularity
+                // (pitch = ±90°) TWO axes jump by 180° simultaneously, and independent
+                // per-axis unwrap produces a third, wrong rotation.
+                //
+                // Instead, we rely on per-tick keyframes (recordIntervalTicks=1, enforced
+                // by config) so BBS CML has no gap to interpolate across at 1x playback.
+                // Each tick's stored Euler triple exactly reconstructs the original
+                // quaternion's rotation matrix (Rz·Ry·Rx of the angles = q's rotation).
+                // Slow-motion playback will still show artifacts — fixing that requires
+                // Option B (quaternion channels + render-time Mixin). See ROTATION_FIX.md.
+                //
+                // Copy the quaternion before normalising — ShipPose is documented as
+                // immutable and pose.worldRotation() returns the live reference.
                 Vector3f euler = new Vector3f();
-                pose.worldRotation().normalize().getEulerAnglesZYX(euler);
-
-                Vector3f prev = prevEulerPerShip.get(pose.shipId());
-                if (prev != null) {
-                    float dx = euler.x - prev.x;
-                    if (dx > (float) Math.PI)  euler.x -= (float) (2 * Math.PI);
-                    if (dx < (float)-Math.PI)  euler.x += (float) (2 * Math.PI);
-                    float dy = euler.y - prev.y;
-                    if (dy > (float) Math.PI)  euler.y -= (float) (2 * Math.PI);
-                    if (dy < (float)-Math.PI)  euler.y += (float) (2 * Math.PI);
-                    float dz = euler.z - prev.z;
-                    if (dz > (float) Math.PI)  euler.z -= (float) (2 * Math.PI);
-                    if (dz < (float)-Math.PI)  euler.z += (float) (2 * Math.PI);
-                }
-                prevEulerPerShip.put(pose.shipId(), new Vector3f(euler));
+                new Quaternionf(pose.worldRotation()).normalize().getEulerAnglesZYX(euler);
 
                 StructureForm form = formPerShip.get(pose.shipId());
                 if (form != null) {
                     KeyframeChannel transformChannel = replay.properties.getOrCreate(form, "transform");
                     Transform t = new Transform();
                     t.rotate.set(euler.x, euler.y, euler.z);
-                    transformChannel.insert((float) relativeTick, t);
+                    transformChannel.insert(tickF, t);
                 }
 
                 if (debugCounter++ % 20 == 0) {
@@ -252,7 +249,6 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 replayPerShip.clear();
                 formPerShip.clear();
                 structureFilePerShip.clear();
-                prevEulerPerShip.clear();
             }
         }
     }
