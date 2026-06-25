@@ -1,9 +1,9 @@
 plugins {
+    id 'fabric-loom' version '1.7-SNAPSHOT'
     id 'java'
-    id 'net.neoforged.moddev' version '1.0.21'
 }
 
-version = '1.21.1-0.2.0'
+version = '1.21.1-0.4.0-nomixin'
 group = 'com.aeronauticscml.bridge'
 
 java {
@@ -12,56 +12,20 @@ java {
 
 repositories {
     mavenCentral()
-    maven { url = 'https://maven.neoforged.net/releases' }
-    maven { url = 'https://maven.valkyrienskies.org' }
-    maven { url = 'https://maven.blamejared.com' }
-    maven { url = 'https://maven.fabricmc.net/' }   // Added Fabric Support
-    flatDir {
-        dirs 'libs'
-    }
-}
-
-neoForge {
-    version = "21.1.77"
-
-    runs {
-        client {
-            client()
-            systemProperty 'neoforge.enabledGameTestNamespaces', 'aeronauticscml'
-        }
-        server {
-            server()
-            programArgument '--nogui'
-            systemProperty 'neoforge.enabledGameTestNamespaces', 'aeronauticscml'
-        }
-    }
-
-    mods {
-        aeronauticscml {
-            sourceSet sourceSets.main
-        }
-    }
+    maven { url = 'https://maven.fabricmc.net/' }
+    flatDir { dirs 'libs' }
 }
 
 dependencies {
-    // ---- Real mod JARs (provided by user, stored in libs/) ----
-    // These are declared as compile-only so we don't bundle them into our JAR.
-    // They must be present in the server's mods/ folder at runtime.
-    //
-    // LOADER COMPATIBILITY NOTE:
-    //   - Sable (SPP) and Create Aeronautics are NeoForge mods.
-    //   - BBS CML Edition is a Fabric mod.
-    //   - For all three to coexist in one server, install Sinytra Connector
-    //     (https://github.com/Sinytra/Connector) on NeoForge. Connector
-    //     re-hosts most Fabric mods (including BBS CML) on NeoForge, so the
-    //     unified classpath exposes both APIs to this bridge.
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${fabric_loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
 
-    compileOnly name: 'sable-neoforge-1.21.1-2.0.3'
-    compileOnly name: 'sable-companion-common-1.21.1-1.6.0'
-    compileOnly name: 'create-aeronautics-bundled-1.21.1-1.3.0'
-    compileOnly name: 'bbs-cml-edition-1.10.3-1.21.1'
-    // Fabric Loader for compile-time resolution of BBSMod
-    compileOnly 'net.fabricmc:fabric-loader:0.16.14'
+    compileOnly files('libs/sable-neoforge-1.21.1-2.0.3.jar')
+    compileOnly files('libs/sable-companion-common-1.21.1-1.6.0.jar')
+    compileOnly files('libs/bbs-cml-edition-1.10.3-1.21.1.jar')
+    compileOnly files('libs/create-aeronautics-bundled-1.21.1-1.3.0.jar')
 }
 
 tasks.withType(JavaCompile).configureEach {
