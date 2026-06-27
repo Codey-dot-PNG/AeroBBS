@@ -20,12 +20,29 @@ import mchorse.bbs_mod.utils.keyframes.Keyframe;
 import mchorse.bbs_mod.utils.keyframes.KeyframeChannel;
 import mchorse.bbs_mod.utils.pose.Transform;
 
+import com.google.gson.Gson;
+import dev.ryanhcode.sable.api.physics.object.ArbitraryPhysicsObject;
+import dev.ryanhcode.sable.api.physics.object.rope.RopePhysicsObject;
+import dev.ryanhcode.sable.companion.math.Pose3dc;
+import dev.ryanhcode.sable.sublevel.ServerSubLevel;
+import dev.ryanhcode.sable.sublevel.system.SubLevelPhysicsSystem;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.phys.Vec3;
+import org.joml.Quaterniond;
+import org.joml.Quaterniondc;
 import org.joml.Quaternionf;
+import org.joml.Vector3d;
+import org.joml.Vector3dc;
 import org.joml.Vector3f;
 
 import java.io.File;
+import java.io.Writer;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -83,7 +100,35 @@ public final class RealCmlRecorder implements ICmlRecorder {
     private final Map<UUID, Quaternionf> lastRotationPerShip = new HashMap<>();
     /** Relative tick of the last rotation keyframe written per ship. */
     private final Map<UUID, Float> lastRotationTickPerShip = new HashMap<>();
+    /** Body-frame offset from the ship physics origin to the structure center-bottom anchor. */
+    private final Map<UUID, Vector3d> centerOffsetPerShip = new HashMap<>();
     private final StructureSnapshotService snapshotService = new StructureSnapshotService();
+
+    private static final Gson GSON = new Gson();
+    /** Captured rope polylines per relative tick (written to a film side-file on stop). */
+    /** Rope side-files, one per ship uuid (so the BBS editor can load by structure uuid). */
+    private final Map<UUID, RopeFile> ropeFilesPerShip = new HashMap<>();
+    private long ropeFrames;
+    /** This tick's center-bottom anchor pose per ship [x,y,z,qx,qy,qz,qw]; set in recordFrame, read in recordRopes. */
+    private final Map<UUID, double[]> anchorPoseThisTick = new HashMap<>();
+    /** First ship recorded this session - fallback owner for ropes we can't attribute. */
+    private UUID primaryShipId;
+    private static java.lang.reflect.Field ropeSubLevelField;
+
+    /**
+     * Serialized side-file form, one file per ship uuid: relativeTick -> ropes (absolute
+     * world points) AND relativeTick -> that ship's center-bottom anchor pose
+     * [x,y,z,qx,qy,qz,qw] at that tick. In-world playback draws the absolute points; the
+     * BBS editor uses the pose to transform them into the ship form's local space.
+     */
+    static final class RopeFile {
+        Map<String, List<RopeSnap>> ticks = new LinkedHashMap<>();
+        Map<String, double[]> poses = new LinkedHashMap<>();
+    }
+    static final class RopeSnap {
+        double radius;
+        double[] points;
+    }
 
     private Film film;
     private String currentFilmName;
@@ -91,6 +136,8 @@ public final class RealCmlRecorder implements ICmlRecorder {
     private long totalFrames;
     private long firstTick = Long.MIN_VALUE;
     private int rotationSubdivisions = 1;
+    private boolean alignStructureToCenter = true;
+    private double renderOffsetX, renderOffsetY, renderOffsetZ;
     private int debugCounter;
 
     @Override
@@ -119,9 +166,19 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 structureFilePerShip.clear();
                 lastRotationPerShip.clear();
                 lastRotationTickPerShip.clear();
+                centerOffsetPerShip.clear();
+                ropeFilesPerShip.clear();
+                anchorPoseThisTick.clear();
+                primaryShipId = null;
+                ropeFrames = 0;
                 debugCounter = 0;
                 firstTick = Long.MIN_VALUE;
-                rotationSubdivisions = clampSubdivisions(BridgeConfig.load().rotationSubdivisions());
+                BridgeConfig cfg = BridgeConfig.load();
+                rotationSubdivisions = clampSubdivisions(cfg.rotationSubdivisions());
+                alignStructureToCenter = cfg.alignStructureToCenter();
+                renderOffsetX = cfg.renderOffsetX();
+                renderOffsetY = cfg.renderOffsetY();
+                renderOffsetZ = cfg.renderOffsetZ();
                 recording = true;
                 AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] CML recording session started. Film='{}', rotationSubdivisions={}",
                         currentFilmName, rotationSubdivisions);
@@ -161,14 +218,23 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 }
 
                 // Position (entity-level, works for StructureForm) - linear interpolation is
-                // correct for translation, so we keep one keyframe per tick here.
+                // correct for translation, so we keep one keyframe per tick here. We record
+                // the world position of the structure's center-bottom anchor (what BBS places
+                // at the form origin), not the raw physics origin, so the replay lines up.
                 float tickF = (float) relativeTick;
-                replay.keyframes.x.insert(tickF, pose.worldPosition().x);
-                replay.keyframes.y.insert(tickF, pose.worldPosition().y);
-                replay.keyframes.z.insert(tickF, pose.worldPosition().z);
+                Vec3 worldPos = computeAnchorWorldPosition(pose);
+                replay.keyframes.x.insert(tickF, worldPos.x);
+                replay.keyframes.y.insert(tickF, worldPos.y);
+                replay.keyframes.z.insert(tickF, worldPos.z);
 
                 // Work on a copy so we never mutate the (documented-immutable) pose quaternion.
                 Quaternionf q = new Quaternionf(pose.worldRotation()).normalize();
+
+                // Stash this tick's center-bottom anchor pose so recordRopes can attach it to
+                // the ship's ropes (lets the BBS editor transform them into form-local space).
+                anchorPoseThisTick.put(pose.shipId(),
+                        new double[]{worldPos.x, worldPos.y, worldPos.z, q.x, q.y, q.z, q.w});
+                if (primaryShipId == null) primaryShipId = pose.shipId();
 
                 StructureForm form = formPerShip.get(pose.shipId());
                 if (form != null) {
@@ -187,6 +253,90 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] CML recordFrame failed for ship {}: {}", pose.shipId(), t.toString(), t);
             }
         }
+    }
+
+    @Override
+    public void recordRopes(ServerLevel level, long tick) {
+        synchronized (lock) {
+            if (!recording || level == null) return;
+            if (firstTick == Long.MIN_VALUE) firstTick = tick;
+            long relativeTick = tick - firstTick;
+            try {
+                SubLevelPhysicsSystem sys = SubLevelPhysicsSystem.get(level);
+                if (sys == null) return;
+
+                String tickKey = Long.toString(relativeTick);
+                boolean any = false;
+                for (ArbitraryPhysicsObject o : sys.getArbitraryObjects()) {
+                    if (!(o instanceof RopePhysicsObject rope)) continue;
+                    var pts = rope.getPoints();
+                    if (pts == null || pts.size() < 2) continue;
+
+                    UUID owner = ropeOwnerUuid(rope);
+                    if (owner == null) owner = primaryShipId;
+                    if (owner == null) continue; // no ship to anchor this rope to
+
+                    double[] arr = new double[pts.size() * 3];
+                    int i = 0;
+                    for (org.joml.Vector3d p : pts) {
+                        arr[i++] = p.x;
+                        arr[i++] = p.y;
+                        arr[i++] = p.z;
+                    }
+                    RopeSnap snap = new RopeSnap();
+                    snap.radius = rope.getCollisionRadius();
+                    snap.points = arr;
+
+                    RopeFile rf = ropeFilesPerShip.computeIfAbsent(owner, k -> new RopeFile());
+                    rf.ticks.computeIfAbsent(tickKey, k -> new ArrayList<>()).add(snap);
+                    double[] pose = anchorPoseThisTick.get(owner);
+                    if (pose != null) rf.poses.put(tickKey, pose);
+                    any = true;
+                }
+                if (any) ropeFrames++;
+            } catch (Throwable t) {
+                if (debugCounter % 200 == 0) {
+                    AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] rope capture failed: {}", t.toString());
+                }
+            }
+        }
+    }
+
+    private void writeRopeFiles() {
+        if (ropeFilesPerShip.isEmpty()) return;
+        try {
+            File worldFolder = BBSMod.getWorldFolder();
+            if (worldFolder == null) return;
+            Path dir = worldFolder.toPath().resolve("aeronauticscml").resolve("ropes");
+            Files.createDirectories(dir);
+            for (Map.Entry<UUID, RopeFile> e : ropeFilesPerShip.entrySet()) {
+                RopeFile rf = e.getValue();
+                if (rf.ticks.isEmpty()) continue;
+                Path out = dir.resolve(e.getKey().toString() + ".json");
+                try (Writer w = Files.newBufferedWriter(out)) {
+                    GSON.toJson(rf, w);
+                }
+                AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Wrote rope side-file {} ({} ticks)", out, rf.ticks.size());
+            }
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] Failed to write rope side-files: {}", t.toString());
+        }
+    }
+
+    /** The ship a rope is attached to (reflective: Sable's startAttachmentSubLevel), or null. */
+    private static UUID ropeOwnerUuid(RopePhysicsObject rope) {
+        try {
+            if (ropeSubLevelField == null) {
+                ropeSubLevelField = RopePhysicsObject.class.getDeclaredField("startAttachmentSubLevel");
+                ropeSubLevelField.setAccessible(true);
+            }
+            Object sub = ropeSubLevelField.get(rope);
+            if (sub instanceof ServerSubLevel ssl) {
+                return ssl.getUniqueId();
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     /**
@@ -232,6 +382,27 @@ public final class RealCmlRecorder implements ICmlRecorder {
         insertConstRotation(channel, tick, current);
         lastRotationPerShip.put(shipId, new Quaternionf(current));
         lastRotationTickPerShip.put(shipId, tick);
+    }
+
+    /**
+     * World position to record for this tick. When alignment is on and we have a
+     * center-bottom offset for the ship, return the world position of that anchor
+     * (physics origin + worldRotation * (D + residual offset)); otherwise the raw
+     * physics origin. This makes the StructureForm sit where the ship actually is.
+     */
+    private Vec3 computeAnchorWorldPosition(ShipPose pose) {
+        Vector3dc p = pose.worldPosition();
+        Vector3d d = centerOffsetPerShip.get(pose.shipId());
+
+        if (!alignStructureToCenter || d == null) {
+            return new Vec3(p.x(), p.y(), p.z());
+        }
+
+        Vector3d local = new Vector3d(d.x + renderOffsetX, d.y + renderOffsetY, d.z + renderOffsetZ);
+        Quaternionf wr = pose.worldRotation();
+        Quaterniond q = new Quaterniond(wr.x, wr.y, wr.z, wr.w).normalize();
+        q.transform(local); // body-frame -> world-frame
+        return new Vec3(p.x() + local.x, p.y() + local.y, p.z() + local.z);
     }
 
     /**
@@ -302,8 +473,51 @@ public final class RealCmlRecorder implements ICmlRecorder {
         return value;
     }
 
+    /**
+     * Compute and store the body-frame offset D from the ship's physics origin to the
+     * structure's center-bottom anchor (the point BBS places at the form origin), using
+     * Sable's pose to transform the local anchor to world. Per tick we then record
+     * {@code physicsOrigin + worldRotation * D}.
+     */
+    private void computeAndStoreCenterOffset(ShipPose pose, dev.ryanhcode.sable.sublevel.ServerSubLevel sl,
+                                             StructureSnapshotService.Result snap) {
+        try {
+            Pose3dc lp = sl.logicalPose();
+            if (lp == null) {
+                centerOffsetPerShip.put(pose.shipId(), new Vector3d());
+                return;
+            }
+            Vec3 anchorWorld = lp.transformPosition(new Vec3(snap.anchorX(), snap.anchorY(), snap.anchorZ()));
+            Vector3dc posSnap = lp.position();
+            Quaterniondc rotSnap = lp.orientation();
+
+            double relx = anchorWorld.x - posSnap.x();
+            double rely = anchorWorld.y - posSnap.y();
+            double relz = anchorWorld.z - posSnap.z();
+            double dist = Math.sqrt(relx * relx + rely * rely + relz * relz);
+
+            if (dist > 256.0) {
+                // Anchor is implausibly far from the physics origin: the local-frame
+                // assumption is probably wrong for this build, so skip the correction.
+                AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] Ship {} anchor sanity failed (dist={}); center alignment disabled for it.",
+                        pose.shipId(), dist);
+                centerOffsetPerShip.put(pose.shipId(), new Vector3d());
+                return;
+            }
+
+            Quaterniond inv = new Quaterniond(rotSnap.x(), rotSnap.y(), rotSnap.z(), rotSnap.w()).normalize().conjugate();
+            Vector3d d = inv.transform(new Vector3d(relx, rely, relz));
+            centerOffsetPerShip.put(pose.shipId(), d);
+            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Ship {} structure center-bottom offset D=({}, {}, {})",
+                    pose.shipId(), String.format("%.3f", d.x), String.format("%.3f", d.y), String.format("%.3f", d.z));
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] Ship {} center-offset computation failed: {}", pose.shipId(), t.toString());
+            centerOffsetPerShip.put(pose.shipId(), new Vector3d());
+        }
+    }
+
     private StructureForm snapshotAndCreateForm(ShipPose pose) {
-        Path structureFile = null;
+        StructureSnapshotService.Result snap = null;
         if (pose.level() instanceof net.minecraft.server.level.ServerLevel serverLevel) {
             try {
                 dev.ryanhcode.sable.api.sublevel.ServerSubLevelContainer container =
@@ -311,7 +525,10 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 if (container != null) {
                     for (dev.ryanhcode.sable.sublevel.ServerSubLevel sl : container.getAllSubLevels()) {
                         if (sl.getUniqueId() != null && sl.getUniqueId().equals(pose.shipId())) {
-                            structureFile = snapshotService.snapshotShip(sl);
+                            snap = snapshotService.snapshotShip(sl);
+                            if (snap != null) {
+                                computeAndStoreCenterOffset(pose, sl, snap);
+                            }
                             break;
                         }
                     }
@@ -322,11 +539,12 @@ public final class RealCmlRecorder implements ICmlRecorder {
             }
         }
 
-        if (structureFile == null) {
+        if (snap == null) {
             AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] Ship {} has no structure snapshot - replay will be camera-only", pose.shipId());
             return null;
         }
 
+        Path structureFile = snap.file();
         structureFilePerShip.put(pose.shipId(), structureFile);
         AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Ship {} structure snapshot: {}", pose.shipId(), structureFile);
 
@@ -375,6 +593,7 @@ public final class RealCmlRecorder implements ICmlRecorder {
                                 filmName,
                                 replayPerShip.size(), formPerShip.size());
                     }
+                    writeRopeFiles();
                 }
             } catch (Throwable t) {
                 AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to save CML film", t);
@@ -387,6 +606,7 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 structureFilePerShip.clear();
                 lastRotationPerShip.clear();
                 lastRotationTickPerShip.clear();
+                centerOffsetPerShip.clear();
             }
         }
     }

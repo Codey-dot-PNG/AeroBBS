@@ -1,14 +1,16 @@
 {
   "schemaVersion": 1,
   "id": "aeronauticscml",
-  "version": "1.21.1-0.4.0",
+  "version": "1.21.1-0.5.0",
   "name": "Aeronautics CML Bridge",
   "description": "Bridges Sable's Physics Pipeline (SPP) / Create Aeronautics ship movements into BBS CML Edition recordings.",
   "authors": ["Codey"],
   "license": "MIT",
   "environment": "*",
   "entrypoints": {
-    "main": ["com.aeronauticscml.bridge.AeroBBSInitializer"]
+    "main": ["com.aeronauticscml.bridge.AeroBBSInitializer"],
+    "client": ["com.aeronauticscml.bridge.client.AeroBBSClient"],
+    "bbs-addon-client": ["com.aeronauticscml.bridge.client.bbs.AeroBBSAddon"]
   },
   "recommends": {
     "sable": "*"

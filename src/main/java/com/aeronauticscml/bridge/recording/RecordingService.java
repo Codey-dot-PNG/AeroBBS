@@ -124,6 +124,15 @@ public final class RecordingService {
                 totalFramesThisSession++;
                 capturedThisTick++;
             }
+
+            // Ropes are level-wide physics objects, not per-ship: capture once per level.
+            if (config.captureRopes() && level instanceof ServerLevel serverLevel) {
+                try {
+                    recorder.recordRopes(serverLevel, tick);
+                } catch (Throwable t) {
+                    AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] recordRopes threw for {}: {}", level, t.toString());
+                }
+            }
         }
         if (capturedThisTick > 0) {
             lastCapturedTick = tick;

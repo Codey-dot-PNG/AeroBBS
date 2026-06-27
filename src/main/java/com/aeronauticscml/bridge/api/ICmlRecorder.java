@@ -34,6 +34,14 @@ public interface ICmlRecorder {
     void recordFrame(ShipPose pose);
 
     /**
+     * Capture the geometry of all physics ropes in the given level for this tick.
+     * Ropes are level-wide (not per-ship), so this is called once per level per
+     * captured tick, after the per-ship {@link #recordFrame(ShipPose)} calls.
+     * Default is a no-op (e.g. the JSONL fallback recorder ignores ropes).
+     */
+    default void recordRopes(net.minecraft.server.level.ServerLevel level, long tick) {}
+
+    /**
      * Flush any buffered data and close the active session. After this call
      * the recorder is ready to be {@link #start(String) started} again.
      */

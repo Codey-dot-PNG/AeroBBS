@@ -32,8 +32,17 @@ import java.util.UUID;
  */
 public final class StructureSnapshotService {
 
+    /**
+     * Result of a snapshot: the saved .nbt path plus the structure's center-bottom
+     * anchor in the ship's local (plot) coordinates. BBS CML renders a StructureForm
+     * with its horizontal center and bottom placed at the form origin, so to align
+     * the replay we record the world position of THIS local point rather than the
+     * ship's physics origin.
+     */
+    public record Result(Path file, double anchorX, double anchorY, double anchorZ) {}
+
     @Nullable
-    public Path snapshotShip(ServerSubLevel ship) {
+    public Result snapshotShip(ServerSubLevel ship) {
         if (ship == null) return null;
         UUID id = ship.getUniqueId();
         if (id == null) return null;
@@ -126,7 +135,43 @@ public final class StructureSnapshotService {
             AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Snapshot for ship {} saved to {} ({} blocks, {}x{}x{})",
                     id, outFile, blockCount, sizeX, sizeY, sizeZ);
 
-            return outFile;
+            // Anchor = horizontal center + bottom of the ACTUAL block bounds (matching how
+            // StructureFormRenderer centers: cx=(boundsMin+boundsMax)/2, cy=boundsMin.y),
+            // not the plot bounds (which may have empty margin). Block "pos" entries are
+            // 0-based relative to worldStart, so add the world start to get plot coords.
+            net.minecraft.nbt.ListTag blocks = tag.getList("blocks", net.minecraft.nbt.Tag.TAG_COMPOUND);
+            int bminX = Integer.MAX_VALUE, bminY = Integer.MAX_VALUE, bminZ = Integer.MAX_VALUE;
+            int bmaxX = Integer.MIN_VALUE, bmaxY = Integer.MIN_VALUE, bmaxZ = Integer.MIN_VALUE;
+            for (int i = 0; i < blocks.size(); i++) {
+                net.minecraft.nbt.ListTag bpos = blocks.getCompound(i).getList("pos", net.minecraft.nbt.Tag.TAG_INT);
+                if (bpos.size() < 3) continue;
+                int px = bpos.getInt(0), py = bpos.getInt(1), pz = bpos.getInt(2);
+                bminX = Math.min(bminX, px); bminY = Math.min(bminY, py); bminZ = Math.min(bminZ, pz);
+                bmaxX = Math.max(bmaxX, px); bmaxY = Math.max(bmaxY, py); bmaxZ = Math.max(bmaxZ, pz);
+            }
+
+            double anchorX, anchorY, anchorZ;
+            if (bmaxX >= bminX) {
+                // BBS's StructureFormRenderer.calculateRenderInfo places structure-local
+                // point (cx - parityAuto) at the form origin, where parityAuto = -0.5 for
+                // an ODD span (so the origin lands on the CENTER of the middle block, not
+                // its corner) and 0 for an even span. The anchor must record the world
+                // position of THAT exact point, otherwise odd-width ships sit ~0.5 block
+                // off. Mirror it: + 0.5 on X/Z for odd width.
+                int widthX = bmaxX - bminX + 1;
+                int widthZ = bmaxZ - bminZ + 1;
+                double parityX = (widthX % 2 == 1) ? 0.5 : 0.0;
+                double parityZ = (widthZ % 2 == 1) ? 0.5 : 0.0;
+                anchorX = startX + (bminX + bmaxX) / 2.0 + parityX;
+                anchorY = startY + bminY;
+                anchorZ = startZ + (bminZ + bmaxZ) / 2.0 + parityZ;
+            } else {
+                anchorX = (startX + endX) / 2.0;
+                anchorY = startY;
+                anchorZ = (startZ + endZ) / 2.0;
+            }
+
+            return new Result(outFile, anchorX, anchorY, anchorZ);
 
         } catch (Throwable t) {
             AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to snapshot SubLevel {}: {}", id, t.toString(), t);
