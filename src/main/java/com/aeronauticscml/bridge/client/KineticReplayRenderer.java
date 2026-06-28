@@ -54,6 +54,10 @@ public final class KineticReplayRenderer {
     private static Field propRotationSpeed;        // public float rotationSpeed
     private static Method propSetAngle;            // void setAngle(float)
     private static Method propSetPreviousAngle;    // void setPreviousAngle(float)
+    private static Class<?> propBearingBeClass;    // dev.eriksonn...PropellerBearingBlockEntity (the big propeller bearing)
+    private static Method propBearingGetRotationSpeed; // public float getRotationSpeed()
+    private static Field bearingAngleField;         // MechanicalBearingBlockEntity.angle (protected base field)
+    private static Field bearingPrevAngleField;     // PropellerBearingBlockEntity.prevAngle (public)
 
     private static long lastDiagMs;
     private static long lastErrMs;
@@ -85,6 +89,35 @@ public final class KineticReplayRenderer {
             // Aeronautics propellers are optional; shafts/cogs still work without them.
             propellerBeClass = null;
         }
+        try {
+            // The big propeller BEARING's rotating "top"/second half: its renderer reads
+            // getInterpolatedAngle, which - with no live contraption entity (our reconstructed
+            // BE has none) - just returns the `angle` field, so advancing that field spins it.
+            propBearingBeClass = Class.forName("dev.eriksonn.aeronautics.content.blocks.propeller.bearing.propeller_bearing.PropellerBearingBlockEntity");
+            propBearingGetRotationSpeed = propBearingBeClass.getMethod("getRotationSpeed");
+            bearingAngleField = findField(propBearingBeClass, "angle");       // on MechanicalBearingBlockEntity (base)
+            bearingPrevAngleField = findField(propBearingBeClass, "prevAngle"); // on PropellerBearingBlockEntity
+        } catch (Throwable t) {
+            propBearingBeClass = null;
+        }
+    }
+
+    /** Find a (possibly inherited / non-public) field by walking up the class hierarchy. */
+    private static Field findField(Class<?> start, String name) {
+        for (Class<?> c = start; c != null; c = c.getSuperclass()) {
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException ignored) {
+                // keep walking up
+            }
+        }
+        return null;
+    }
+
+    private static double wrap360(double v) {
+        return ((v % 360.0) + 360.0) % 360.0;
     }
 
     private static final class Placed {
@@ -191,17 +224,34 @@ public final class KineticReplayRenderer {
      * clock; the renderer's interpolation then reads a smooth, advancing angle.
      */
     private static void drivePropeller(BlockEntity be, double scale, long gameTime, float partial) {
-        if (propellerBeClass == null || !propellerBeClass.isInstance(be)) {
+        // Small single-block propellers: advance the blade angle from recorded rotationSpeed.
+        if (propellerBeClass != null && propellerBeClass.isInstance(be)) {
+            try {
+                float rotationSpeed = propRotationSpeed.getFloat(be);
+                double angle = wrap360(rotationSpeed * scale * (gameTime + partial));
+                propSetPreviousAngle.invoke(be, (float) angle);
+                propSetAngle.invoke(be, (float) angle);
+            } catch (Throwable ignored) {
+                // leave the blade at whatever angle it has
+            }
             return;
         }
-        try {
-            float rotationSpeed = propRotationSpeed.getFloat(be);
-            double base = rotationSpeed * scale;
-            double angle = ((base * (gameTime + partial)) % 360.0 + 360.0) % 360.0;
-            propSetPreviousAngle.invoke(be, (float) angle);
-            propSetAngle.invoke(be, (float) angle);
-        } catch (Throwable ignored) {
-            // leave the blade at whatever angle it has
+
+        // Big propeller BEARING: spin its rotating "top" / second half. The blade contraption
+        // (a separate captured form) already spins via keyframes, but the bearing block sits in
+        // the ship snapshot and its top is BER-driven. With no live contraption entity here,
+        // getInterpolatedAngle returns the `angle` field, so we advance it from the recorded
+        // rotationSpeed (deg/tick) - matching the blades' rate (no propellerSpeedScale, since the
+        // big-prop blades use the exact recorded angle, not the scaled approximation).
+        if (propBearingBeClass != null && propBearingBeClass.isInstance(be)) {
+            try {
+                float rotationSpeed = (float) propBearingGetRotationSpeed.invoke(be);
+                double angle = wrap360(rotationSpeed * (gameTime + partial));
+                if (bearingAngleField != null) bearingAngleField.setFloat(be, (float) angle);
+                if (bearingPrevAngleField != null) bearingPrevAngleField.setFloat(be, (float) angle);
+            } catch (Throwable ignored) {
+                // leave the bearing top at whatever angle it has
+            }
         }
     }
 

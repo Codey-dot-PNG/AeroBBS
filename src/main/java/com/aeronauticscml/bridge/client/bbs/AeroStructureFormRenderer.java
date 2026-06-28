@@ -41,6 +41,15 @@ public class AeroStructureFormRenderer extends StructureFormRenderer {
     protected void render3D(FormRenderingContext context) {
         super.render3D(context); // BBS's normal static structure render (unchanged)
 
+        // Skip our extra geometry during BBS's PICKING pass (when the mouse hovers the
+        // viewport, BBS re-renders forms into a stencil buffer to detect the hovered form).
+        // Drawing kinetics/ropes through Minecraft's buffer source + endBatch() mid-stencil
+        // corrupts that pass and visibly glitches the editor UI. BBS's own static render
+        // (super.render3D) already handles picking correctly; we just stay out of it.
+        if (context.isPicking()) {
+            return;
+        }
+
         try {
             PoseStack stack = stackOf(context);
             if (stack == null) {
