@@ -118,9 +118,9 @@ public final class ReplayContraptionRenderer {
                             drawMarker(stack, vc, cam, xObj, yObj, zObj, transform);
                         }
                         drawn++;
-                        // Ropes are keyed per ship uuid now (so the editor can load them by
-                        // structure uuid); draw this ship's ropes at its replay-local tick.
-                        ropesDrawn += drawRopes(stack, consumers, cam, replay.uuid.get(), replay.getTick(baseTick));
+                        // Ropes are keyed per ship uuid; draw this ship's ropes at its
+                        // replay-local FRACTIONAL tick so they interpolate smoothly.
+                        ropesDrawn += drawRopes(stack, consumers, cam, replay.uuid.get(), replay.getTick(baseTick) + td);
 
                         if (sample.isEmpty()) {
                             sample = String.format("  ship@(%.1f,%.1f,%.1f) cam@(%.1f,%.1f,%.1f)", xObj, yObj, zObj, cam.x, cam.y, cam.z);
@@ -180,24 +180,37 @@ public final class ReplayContraptionRenderer {
         stack.popPose();
     }
 
-    /** Draw a ship's recorded rope polylines at the current playback tick, as textured tubes. */
-    private static int drawRopes(PoseStack stack, MultiBufferSource consumers, Vec3 cam, String key, int tick) {
-        List<RopeDataStore.RopeSnap> ropes = RopeDataStore.ropesAt(key, tick);
-        if (ropes == null || ropes.isEmpty()) {
+    /**
+     * Draw a ship's recorded rope polylines at a fractional playback tick, as textured
+     * tubes, interpolating between the two bracketing recorded snapshots so the rope
+     * animates smoothly instead of stepping at the record rate. Points are absolute world
+     * coordinates (lerped), then offset by the camera.
+     */
+    private static int drawRopes(PoseStack stack, MultiBufferSource consumers, Vec3 cam, String key, float tickF) {
+        RopeDataStore.Frame fr = RopeDataStore.frameAt(key, tickF);
+        if (fr == null || fr.ropes0 == null || fr.ropes0.isEmpty()) {
             return 0;
         }
+        boolean canBlend = fr.alpha > 0F && fr.ropes1 != null;
+        float alpha = fr.alpha;
         VertexConsumer vc = consumers.getBuffer(RenderType.entityCutoutNoCull(RopeMesh.ROPE));
 
         int count = 0;
-        for (RopeDataStore.RopeSnap rope : ropes) {
-            double[] p = rope.points;
-            if (p == null || p.length < 6) continue;
-            float radius = (float) Math.max(0.04, Math.min(0.5, rope.radius > 0 ? rope.radius : 0.08));
+        for (int r = 0; r < fr.ropes0.size(); r++) {
+            double[] a = fr.ropes0.get(r).points;
+            if (a == null || a.length < 6) continue;
+            float radius = (float) Math.max(0.04, Math.min(0.5, fr.ropes0.get(r).radius > 0 ? fr.ropes0.get(r).radius : 0.08));
 
-            Vector3f prev = new Vector3f((float) (p[0] - cam.x), (float) (p[1] - cam.y), (float) (p[2] - cam.z));
+            double[] b = null;
+            if (canBlend && r < fr.ropes1.size()) {
+                double[] cand = fr.ropes1.get(r).points;
+                if (cand != null && cand.length == a.length) b = cand;
+            }
+
+            Vector3f prev = worldPoint(a, b, 0, alpha, cam);
             RopeMesh.node(stack, vc, prev, FULL_BRIGHT);
-            for (int i = 3; i + 2 < p.length; i += 3) {
-                Vector3f cur = new Vector3f((float) (p[i] - cam.x), (float) (p[i + 1] - cam.y), (float) (p[i + 2] - cam.z));
+            for (int i = 3; i + 2 < a.length; i += 3) {
+                Vector3f cur = worldPoint(a, b, i, alpha, cam);
                 RopeMesh.tube(stack, vc, prev, cur, radius, FULL_BRIGHT);
                 RopeMesh.node(stack, vc, cur, FULL_BRIGHT);
                 prev = cur;
@@ -205,6 +218,17 @@ public final class ReplayContraptionRenderer {
             count++;
         }
         return count;
+    }
+
+    /** Absolute world point at index {@code i}, lerped toward the next sample, camera-relative. */
+    private static Vector3f worldPoint(double[] a, double[] b, int i, float alpha, Vec3 cam) {
+        double x = a[i], y = a[i + 1], z = a[i + 2];
+        if (b != null) {
+            x += (b[i] - x) * alpha;
+            y += (b[i + 1] - y) * alpha;
+            z += (b[i + 2] - z) * alpha;
+        }
+        return new Vector3f((float) (x - cam.x), (float) (y - cam.y), (float) (z - cam.z));
     }
 
     /** Render a solid axis-aligned box (6 faces) in the current pose, colored, full-bright. */

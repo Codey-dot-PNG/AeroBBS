@@ -54,11 +54,13 @@ public class AeroStructureFormRenderer extends StructureFormRenderer {
 
             KineticReplayRenderer.renderInFormSpace(stack, buffers, this.getForm(), partial, light);
 
-            // Ropes in the editor: BBS's actor entity carries the playback tick (getAge);
-            // the rope renderer transforms the recorded absolute polyline into this form's
-            // local space using the per-tick anchor pose stored at record time.
-            int tick = (context.entity != null) ? context.entity.getAge() : 0;
-            RopeReplayRenderer.renderInFormSpace(stack, buffers, this.getForm(), tick, light);
+            // Ropes in the editor: BBS's actor entity carries the integer playback tick
+            // (getAge) and the context the sub-tick partial (transition); together they give
+            // the fractional playback tick. The rope renderer interpolates between recorded
+            // snapshots at that fractional tick so the rope animates smoothly (not stepped at
+            // the 20 Hz record rate), transformed into this form's local space.
+            float ropeTick = (context.entity != null) ? context.entity.getAge() + context.transition : 0F;
+            RopeReplayRenderer.renderInFormSpace(stack, buffers, this.getForm(), ropeTick, light);
 
             buffers.endBatch();
         } catch (Throwable t) {

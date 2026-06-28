@@ -20,12 +20,22 @@ import java.util.List;
  * renderer), in the ship form's LOCAL space. The recorder stores ropes as absolute
  * world polylines plus the ship's center-bottom anchor pose per tick (keyed by ship
  * uuid); we transform each point into form-local space with the inverse of that pose,
- * then draw a textured tube ({@link RopeMesh}) so it reads like real cord.
+ * then draw a textured tube ({@link RopeMesh}).
+ *
+ * <p>Ropes are sampled at the record cadence (≤20 Hz) but the form moves at the render
+ * frame rate, so we interpolate the rope shape between the two bracketing recorded
+ * snapshots at the FRACTIONAL playback tick. Doing the blend in form-local space (each
+ * endpoint transformed by its own anchor pose, then lerped) keeps the rope glued to the
+ * smoothly-interpolated ship instead of stepping/swimming.</p>
  */
 public final class RopeReplayRenderer {
     private RopeReplayRenderer() {}
 
-    public static int renderInFormSpace(PoseStack stack, MultiBufferSource consumers, StructureForm form, int tick, int light) {
+    /** Max form-local jump of a rope's first node between adjacent samples before we stop
+     *  blending it (guards against two ropes swapping order across a frame). */
+    private static final float MAX_LOCAL_JUMP = 8.0F;
+
+    public static int renderInFormSpace(PoseStack stack, MultiBufferSource consumers, StructureForm form, float tickF, int light) {
         if (!BridgeConfig.load().experimentalDynamicRender()) {
             return 0;
         }
@@ -33,28 +43,47 @@ public final class RopeReplayRenderer {
         if (uuid == null) {
             return 0;
         }
-        List<RopeDataStore.RopeSnap> ropes = RopeDataStore.ropesAt(uuid, tick);
-        double[] pose = RopeDataStore.poseAt(uuid, tick);
-        if (ropes == null || ropes.isEmpty() || pose == null) {
+        RopeDataStore.Frame fr = RopeDataStore.frameAt(uuid, tickF);
+        if (fr == null || fr.ropes0 == null || fr.ropes0.isEmpty() || fr.pose0 == null) {
             return 0;
         }
 
-        // form-local = inverse(orientation) * (worldPoint - anchorPos)
-        Quaternionf invRot = new Quaternionf((float) pose[3], (float) pose[4], (float) pose[5], (float) pose[6]).invert();
-        double ax = pose[0], ay = pose[1], az = pose[2];
+        Quaternionf invRot0 = quat(fr.pose0).invert();
+        double ax0 = fr.pose0[0], ay0 = fr.pose0[1], az0 = fr.pose0[2];
+
+        boolean canBlend = fr.alpha > 0F && fr.ropes1 != null && fr.pose1 != null;
+        Quaternionf invRot1 = canBlend ? quat(fr.pose1).invert() : null;
+        double ax1 = canBlend ? fr.pose1[0] : 0, ay1 = canBlend ? fr.pose1[1] : 0, az1 = canBlend ? fr.pose1[2] : 0;
+        float alpha = fr.alpha;
+
         VertexConsumer vc = consumers.getBuffer(RenderType.entityCutoutNoCull(RopeMesh.ROPE));
 
         int count = 0;
-        for (RopeDataStore.RopeSnap rope : ropes) {
-            double[] p = rope.points;
-            if (p == null || p.length < 6) {
+        for (int r = 0; r < fr.ropes0.size(); r++) {
+            double[] a = fr.ropes0.get(r).points;
+            if (a == null || a.length < 6) {
                 continue;
             }
-            float radius = (float) Math.max(0.04, Math.min(0.5, rope.radius > 0 ? rope.radius : 0.08));
-            Vector3f prev = toLocal(invRot, p[0] - ax, p[1] - ay, p[2] - az);
+            float radius = (float) Math.max(0.04, Math.min(0.5, fr.ropes0.get(r).radius > 0 ? fr.ropes0.get(r).radius : 0.08));
+
+            // The matching next-tick polyline, only if it lines up (same point count + the
+            // first node didn't teleport in form-local space).
+            double[] b = null;
+            if (canBlend && r < fr.ropes1.size()) {
+                double[] cand = fr.ropes1.get(r).points;
+                if (cand != null && cand.length == a.length) {
+                    Vector3f l0 = local(invRot0, a[0] - ax0, a[1] - ay0, a[2] - az0);
+                    Vector3f l1 = local(invRot1, cand[0] - ax1, cand[1] - ay1, cand[2] - az1);
+                    if (l0.distance(l1) <= MAX_LOCAL_JUMP) {
+                        b = cand;
+                    }
+                }
+            }
+
+            Vector3f prev = blendLocal(invRot0, a, ax0, ay0, az0, invRot1, b, ax1, ay1, az1, 0, alpha);
             RopeMesh.node(stack, vc, prev, light);
-            for (int i = 3; i + 2 < p.length; i += 3) {
-                Vector3f cur = toLocal(invRot, p[i] - ax, p[i + 1] - ay, p[i + 2] - az);
+            for (int i = 3; i + 2 < a.length; i += 3) {
+                Vector3f cur = blendLocal(invRot0, a, ax0, ay0, az0, invRot1, b, ax1, ay1, az1, i, alpha);
                 RopeMesh.tube(stack, vc, prev, cur, radius, light);
                 RopeMesh.node(stack, vc, cur, light);
                 prev = cur;
@@ -64,8 +93,24 @@ public final class RopeReplayRenderer {
         return count;
     }
 
-    private static Vector3f toLocal(Quaternionf invRot, double dx, double dy, double dz) {
+    /** Form-local point at index {@code i}, blended toward the next sample when available. */
+    private static Vector3f blendLocal(Quaternionf invRot0, double[] a, double ax0, double ay0, double az0,
+                                       Quaternionf invRot1, double[] b, double ax1, double ay1, double az1,
+                                       int i, float alpha) {
+        Vector3f l0 = local(invRot0, a[i] - ax0, a[i + 1] - ay0, a[i + 2] - az0);
+        if (b == null) {
+            return l0;
+        }
+        Vector3f l1 = local(invRot1, b[i] - ax1, b[i + 1] - ay1, b[i + 2] - az1);
+        return l0.lerp(l1, alpha);
+    }
+
+    private static Vector3f local(Quaternionf invRot, double dx, double dy, double dz) {
         return invRot.transform(new Vector3f((float) dx, (float) dy, (float) dz));
+    }
+
+    private static Quaternionf quat(double[] pose) {
+        return new Quaternionf((float) pose[3], (float) pose[4], (float) pose[5], (float) pose[6]);
     }
 
     private static String safeFile(StructureForm form) {
