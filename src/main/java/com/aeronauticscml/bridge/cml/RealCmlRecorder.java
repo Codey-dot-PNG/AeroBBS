@@ -25,8 +25,17 @@ import dev.ryanhcode.sable.api.physics.object.ArbitraryPhysicsObject;
 import dev.ryanhcode.sable.api.physics.object.rope.RopePhysicsObject;
 import dev.ryanhcode.sable.companion.math.Pose3dc;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
+import dev.ryanhcode.sable.sublevel.plot.LevelPlot;
 import dev.ryanhcode.sable.sublevel.system.SubLevelPhysicsSystem;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Quaterniond;
 import org.joml.Quaterniondc;
@@ -37,6 +46,8 @@ import org.joml.Vector3f;
 
 import java.io.File;
 import java.io.Writer;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -102,7 +113,32 @@ public final class RealCmlRecorder implements ICmlRecorder {
     private final Map<UUID, Float> lastRotationTickPerShip = new HashMap<>();
     /** Body-frame offset from the ship physics origin to the structure center-bottom anchor. */
     private final Map<UUID, Vector3d> centerOffsetPerShip = new HashMap<>();
+    /** Cached ServerSubLevel per ship (for per-tick contraption capture without re-scanning). */
+    private final Map<UUID, ServerSubLevel> subLevelPerShip = new HashMap<>();
+    /** Propeller-bearing block positions per ship, scanned once on first capture. */
+    private final Map<UUID, List<BlockPos>> bearingPositionsPerShip = new HashMap<>();
+    /** Per blade-contraption (keyed by its entity uuid): its replay/form + local anchor. */
+    private final Map<UUID, ContraptionRec> contraptionRecs = new HashMap<>();
     private final StructureSnapshotService snapshotService = new StructureSnapshotService();
+
+    /** A captured propeller blade contraption: its BBS replay/form and center-bottom anchor (contraption-local frame). */
+    private static final class ContraptionRec {
+        final Replay replay;
+        final StructureForm form;
+        final double anchorX, anchorY, anchorZ;
+        ContraptionRec(Replay replay, StructureForm form, double anchorX, double anchorY, double anchorZ) {
+            this.replay = replay; this.form = form;
+            this.anchorX = anchorX; this.anchorY = anchorY; this.anchorZ = anchorZ;
+        }
+    }
+
+    // Reflective handles for Create/Aeronautics types (jarjar'd / not on the compile
+    // classpath). Resolved lazily from the live runtime classes and cached.
+    private static volatile boolean propBearingClassResolved;
+    private static volatile Class<?> propBearingClassCached;
+    private static Method mGetMovedContraption;
+    private static Method mGetContraption, mGetBlocks, mGetAngle, mGetRotationAxis;
+    private static Field fTiltQuat, fDirection;
 
     private static final Gson GSON = new Gson();
     /** Captured rope polylines per relative tick (written to a film side-file on stop). */
@@ -137,6 +173,7 @@ public final class RealCmlRecorder implements ICmlRecorder {
     private long firstTick = Long.MIN_VALUE;
     private int rotationSubdivisions = 1;
     private boolean alignStructureToCenter = true;
+    private boolean captureContraptions = true;
     private double renderOffsetX, renderOffsetY, renderOffsetZ;
     private int debugCounter;
 
@@ -167,6 +204,9 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 lastRotationPerShip.clear();
                 lastRotationTickPerShip.clear();
                 centerOffsetPerShip.clear();
+                subLevelPerShip.clear();
+                bearingPositionsPerShip.clear();
+                contraptionRecs.clear();
                 ropeFilesPerShip.clear();
                 anchorPoseThisTick.clear();
                 primaryShipId = null;
@@ -176,6 +216,7 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 BridgeConfig cfg = BridgeConfig.load();
                 rotationSubdivisions = clampSubdivisions(cfg.rotationSubdivisions());
                 alignStructureToCenter = cfg.alignStructureToCenter();
+                captureContraptions = cfg.captureContraptions();
                 renderOffsetX = cfg.renderOffsetX();
                 renderOffsetY = cfg.renderOffsetY();
                 renderOffsetZ = cfg.renderOffsetZ();
@@ -240,6 +281,15 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 if (form != null) {
                     KeyframeChannel transformChannel = replay.properties.getOrCreate(form, "transform");
                     writeRotationKeyframes(pose.shipId(), transformChannel, tickF, q);
+                }
+
+                // Propeller-bearing blade contraptions are not part of the ship's block grid
+                // (Create moves them into a separate contraption entity) and are not turned
+                // into a Sable sub-ship, so the ship snapshot misses them. Capture each as its
+                // own spinning StructureForm replay. Fully guarded - never breaks ship capture.
+                if (captureContraptions) {
+                    ServerSubLevel sl = findSubLevel(pose);
+                    if (sl != null) recordContraptions(pose, sl, tickF);
                 }
 
                 if (debugCounter++ % 100 == 0) {
@@ -518,23 +568,15 @@ public final class RealCmlRecorder implements ICmlRecorder {
 
     private StructureForm snapshotAndCreateForm(ShipPose pose) {
         StructureSnapshotService.Result snap = null;
-        if (pose.level() instanceof net.minecraft.server.level.ServerLevel serverLevel) {
+        ServerSubLevel sl = findSubLevel(pose);
+        if (sl != null) {
             try {
-                dev.ryanhcode.sable.api.sublevel.ServerSubLevelContainer container =
-                        dev.ryanhcode.sable.api.sublevel.SubLevelContainer.getContainer(serverLevel);
-                if (container != null) {
-                    for (dev.ryanhcode.sable.sublevel.ServerSubLevel sl : container.getAllSubLevels()) {
-                        if (sl.getUniqueId() != null && sl.getUniqueId().equals(pose.shipId())) {
-                            snap = snapshotService.snapshotShip(sl);
-                            if (snap != null) {
-                                computeAndStoreCenterOffset(pose, sl, snap);
-                            }
-                            break;
-                        }
-                    }
+                snap = snapshotService.snapshotShip(sl);
+                if (snap != null) {
+                    computeAndStoreCenterOffset(pose, sl, snap);
                 }
             } catch (Throwable t) {
-                AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to find SubLevel for ship {} during snapshot: {}",
+                AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to snapshot ship {}: {}",
                         pose.shipId(), t.toString(), t);
             }
         }
@@ -548,6 +590,44 @@ public final class RealCmlRecorder implements ICmlRecorder {
         structureFilePerShip.put(pose.shipId(), structureFile);
         AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Ship {} structure snapshot: {}", pose.shipId(), structureFile);
 
+        StructureForm form = createStructureForm(structureFile);
+        if (form != null) {
+            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Created StructureForm for ship {} pointing at world:{}",
+                    pose.shipId(), structureFile.getFileName());
+        }
+        return form;
+    }
+
+    /**
+     * Look up (and cache) the Sable {@link ServerSubLevel} backing a ship, so we can read
+     * its live pose and scan its plot every tick without re-enumerating the container.
+     */
+    private ServerSubLevel findSubLevel(ShipPose pose) {
+        ServerSubLevel cached = subLevelPerShip.get(pose.shipId());
+        if (cached != null) return cached;
+        if (!(pose.level() instanceof ServerLevel serverLevel)) return null;
+        try {
+            dev.ryanhcode.sable.api.sublevel.ServerSubLevelContainer container =
+                    dev.ryanhcode.sable.api.sublevel.SubLevelContainer.getContainer(serverLevel);
+            if (container == null) return null;
+            for (ServerSubLevel sl : container.getAllSubLevels()) {
+                if (sl.getUniqueId() != null && sl.getUniqueId().equals(pose.shipId())) {
+                    subLevelPerShip.put(pose.shipId(), sl);
+                    return sl;
+                }
+            }
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] findSubLevel failed for {}: {}", pose.shipId(), t.toString());
+        }
+        return null;
+    }
+
+    /**
+     * Create a BBS {@link StructureForm} pointing at a snapshot .nbt via the "world:"
+     * prefix (resolved by BBS CML's WorldStructuresSourcePack). Shared by ships and
+     * propeller blade contraptions.
+     */
+    private StructureForm createStructureForm(Path structureFile) {
         try {
             FormArchitect forms = BBSMod.getForms();
             if (forms == null) {
@@ -560,22 +640,253 @@ public final class RealCmlRecorder implements ICmlRecorder {
                         form == null ? "null" : form.getClass().getName());
                 return null;
             }
-
-            // Use "world:" prefix so BBS CML's WorldStructuresSourcePack resolves
-            // it to <world>/generated/minecraft/structures/<filename>.nbt
             String fileName = structureFile.getFileName().toString().replace('\\', '/');
-            String bbsPath = "world:" + fileName;
-            structureForm.structureFile.set(bbsPath);
-
-            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Created StructureForm for ship {} pointing at {}",
-                    pose.shipId(), bbsPath);
-
+            structureForm.structureFile.set("world:" + fileName);
             return structureForm;
         } catch (Throwable t) {
-            AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to create StructureForm for ship {}: {}",
-                    pose.shipId(), t.toString(), t);
+            AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to create StructureForm for {}: {}",
+                    structureFile, t.toString(), t);
             return null;
         }
+    }
+
+    // ---- Propeller-bearing blade contraption capture --------------------------------
+
+    /**
+     * Capture/refresh this ship's propeller-bearing blade contraptions for this tick.
+     *
+     * <p>A propeller bearing's blades are a Create contraption (assembled blocks rotating
+     * about the bearing axis) held in a {@code PropellerBearingContraptionEntity}, NOT in
+     * the ship's block grid and NOT a Sable sub-ship - so the ship snapshot misses them.
+     * We snapshot the blocks once as their own StructureForm, then each tick keyframe the
+     * form's world transform = ship_pose o tilt o spin(axis, angle), so the blades render
+     * and spin on exactly the same path as a ship form.</p>
+     *
+     * <p>The transform mirrors {@code PropellerBearingContraptionEntity.applyLocalTransforms}
+     * (decoded from bytecode): a blade-local point {@code p} maps to
+     * {@code entityPos + 0.5 - o + R_tilt*( o + R_spin*(p - 0.5) )} in the sublevel, with
+     * {@code o = 0.75 * facing}, {@code R_spin = rotate(angle deg, axis)}, {@code R_tilt =
+     * tiltQuat}; the sublevel point is then mapped to the world by the ship's logical pose.
+     * BBS rotates a form about its center-bottom anchor, so we record that anchor's world
+     * position as the position keyframe and the full rotation as the transform keyframe.</p>
+     *
+     * <p>Everything Create/Aeronautics is reflective (jarjar'd, off the compile classpath);
+     * any failure is swallowed so ship/rope capture is never affected.</p>
+     */
+    private void recordContraptions(ShipPose pose, ServerSubLevel sl, float tickF) {
+        try {
+            Class<?> bearingClass = propBearingClass();
+            if (bearingClass == null) return; // Aeronautics not present
+            if (!(sl.getLevel() instanceof ServerLevel plotLevel)) return;
+            Pose3dc lp = sl.logicalPose();
+            if (lp == null) return;
+
+            List<BlockPos> bearings = bearingPositionsPerShip.get(pose.shipId());
+            if (bearings == null) {
+                bearings = scanBearingPositions(plotLevel, sl, bearingClass);
+                bearingPositionsPerShip.put(pose.shipId(), bearings);
+                if (!bearings.isEmpty()) {
+                    AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Ship {} has {} propeller bearing(s) for contraption capture",
+                            pose.shipId(), bearings.size());
+                }
+            }
+            if (bearings.isEmpty()) return;
+
+            Quaternionf shipRot = new Quaternionf(pose.worldRotation()).normalize();
+
+            for (BlockPos bp : bearings) {
+                try {
+                    BlockEntity be = plotLevel.getBlockEntity(bp);
+                    if (be == null || !bearingClass.isInstance(be)) continue;
+                    Object contraption = getMovedContraption(be);
+                    if (!(contraption instanceof Entity ce)) continue; // null = bearing not assembled
+                    UUID cid = ce.getUUID();
+
+                    ContraptionRec rec = contraptionRecs.get(cid);
+                    if (rec == null) {
+                        rec = createContraptionReplay(plotLevel, contraption, cid, pose);
+                        if (rec == null) continue;
+                        contraptionRecs.put(cid, rec);
+                    }
+
+                    float angle = getAngle(contraption);            // spin, degrees
+                    Direction dir = getDirection(contraption);      // bearing facing
+                    Direction.Axis axis = getRotationAxis(contraption);
+                    if (axis == null) axis = dir.getAxis();
+                    Quaternionf tilt = getTiltQuat(contraption);    // identity for non-gyro
+                    Vec3 entityPos = ce.position();
+
+                    Quaternionf spin = spinQuat(axis, angle);
+                    // Local (contraption-frame) offsets are small, so float precision is ample;
+                    // entityPos stays double. subPos(anchor) = entityPos + 0.5 - o + R_tilt*( o + R_spin*(anchor - 0.5) )
+                    Vector3f o = new Vector3f(dir.getStepX() * 0.75f, dir.getStepY() * 0.75f, dir.getStepZ() * 0.75f);
+                    Vector3f hp = new Vector3f((float) (rec.anchorX - 0.5), (float) (rec.anchorY - 0.5), (float) (rec.anchorZ - 0.5));
+                    Vector3f spun = spin.transform(hp, new Vector3f());
+                    spun.add(o);
+                    Vector3f tilted = tilt.transform(spun, new Vector3f());
+                    Vec3 subPos = new Vec3(
+                            entityPos.x + 0.5 - o.x + tilted.x,
+                            entityPos.y + 0.5 - o.y + tilted.y,
+                            entityPos.z + 0.5 - o.z + tilted.z);
+                    Vec3 world = lp.transformPosition(subPos);
+
+                    rec.replay.keyframes.x.insert(tickF, world.x);
+                    rec.replay.keyframes.y.insert(tickF, world.y);
+                    rec.replay.keyframes.z.insert(tickF, world.z);
+
+                    // R_keyframe = ship_rotation o tilt o spin (spin applied first).
+                    Quaternionf q = new Quaternionf(shipRot).mul(tilt).mul(spin).normalize();
+                    KeyframeChannel tc = rec.replay.properties.getOrCreate(rec.form, "transform");
+                    writeRotationKeyframes(cid, tc, tickF, q);
+                } catch (Throwable inner) {
+                    if (debugCounter % 200 == 0) {
+                        AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] contraption tick failed at {}: {}", bp, inner.toString());
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            if (debugCounter % 200 == 0) {
+                AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] recordContraptions failed for {}: {}", pose.shipId(), t.toString());
+            }
+        }
+    }
+
+    /** Snapshot a contraption's blocks to a structure .nbt and allocate its BBS replay/form. */
+    private ContraptionRec createContraptionReplay(ServerLevel plotLevel, Object contraption, UUID cid, ShipPose pose) {
+        try {
+            Map<BlockPos, StructureTemplate.StructureBlockInfo> blocks = getContraptionBlocks(contraption);
+            if (blocks == null || blocks.isEmpty()) return null;
+            StructureSnapshotService.Result snap = snapshotService.snapshotBlockMap(plotLevel, blocks, cid);
+            if (snap == null) return null;
+            StructureForm form = createStructureForm(snap.file());
+            if (form == null) return null;
+            Replay replay = film.replays.addReplay();
+            replay.label.set("propeller-" + cid.toString().substring(0, 8));
+            replay.uuid.set(cid.toString());
+            replay.form.set(form);
+            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Captured propeller contraption {} ({} blocks) on ship {}",
+                    cid, blocks.size(), pose.shipId());
+            return new ContraptionRec(replay, form, snap.anchorX(), snap.anchorY(), snap.anchorZ());
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] Failed to create contraption replay {}: {}", cid, t.toString());
+            return null;
+        }
+    }
+
+    /** Scan a ship's plot chunks once for propeller-bearing block entities. */
+    private List<BlockPos> scanBearingPositions(ServerLevel plotLevel, ServerSubLevel sl, Class<?> bearingClass) {
+        List<BlockPos> out = new ArrayList<>();
+        try {
+            LevelPlot plot = sl.getPlot();
+            if (plot == null) return out;
+            ChunkPos cmin = plot.getChunkMin();
+            ChunkPos cmax = plot.getChunkMax();
+            ServerChunkCache scc = plotLevel.getChunkSource();
+            for (int cx = cmin.x; cx <= cmax.x; cx++) {
+                for (int cz = cmin.z; cz <= cmax.z; cz++) {
+                    LevelChunk chunk = scc.getChunkNow(cx, cz);
+                    if (chunk == null) continue;
+                    for (Map.Entry<BlockPos, BlockEntity> e : chunk.getBlockEntities().entrySet()) {
+                        if (bearingClass.isInstance(e.getValue())) out.add(e.getKey().immutable());
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] scanBearingPositions failed: {}", t.toString());
+        }
+        return out;
+    }
+
+    /** Quaternion for a spin of {@code angleDeg} degrees about a block axis (matches catnip VecHelper.rotate). */
+    private static Quaternionf spinQuat(Direction.Axis axis, float angleDeg) {
+        float rad = (float) Math.toRadians(angleDeg);
+        if (axis == Direction.Axis.X) return new Quaternionf().rotationX(rad);
+        if (axis == Direction.Axis.Y) return new Quaternionf().rotationY(rad);
+        if (axis == Direction.Axis.Z) return new Quaternionf().rotationZ(rad);
+        return new Quaternionf();
+    }
+
+    // ---- Reflection into Create/Aeronautics (jarjar'd, not on the compile classpath) ----
+
+    private static Class<?> propBearingClass() {
+        if (!propBearingClassResolved) {
+            synchronized (RealCmlRecorder.class) {
+                if (!propBearingClassResolved) {
+                    try {
+                        propBearingClassCached = Class.forName(
+                                "dev.eriksonn.aeronautics.content.blocks.propeller.bearing.propeller_bearing.PropellerBearingBlockEntity");
+                    } catch (Throwable t) {
+                        propBearingClassCached = null;
+                    }
+                    propBearingClassResolved = true;
+                }
+            }
+        }
+        return propBearingClassCached;
+    }
+
+    private static Object getMovedContraption(Object bearing) throws Exception {
+        Method m = mGetMovedContraption;
+        if (m == null) {
+            m = propBearingClass().getMethod("getMovedContraption");
+            mGetMovedContraption = m;
+        }
+        return m.invoke(bearing);
+    }
+
+    private static void ensureContraptionReflection(Object contraption) throws Exception {
+        if (mGetContraption == null) {
+            Class<?> c = contraption.getClass();
+            mGetContraption = c.getMethod("getContraption");
+            mGetAngle = c.getMethod("getAngle", float.class);
+            mGetRotationAxis = c.getMethod("getRotationAxis");
+            fTiltQuat = c.getField("tiltQuat");
+            fDirection = c.getField("direction");
+            mGetBlocks = mGetContraption.getReturnType().getMethod("getBlocks");
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<BlockPos, StructureTemplate.StructureBlockInfo> getContraptionBlocks(Object contraption) throws Exception {
+        ensureContraptionReflection(contraption);
+        Object contraptionObj = mGetContraption.invoke(contraption);
+        if (contraptionObj == null) return null;
+        return (Map<BlockPos, StructureTemplate.StructureBlockInfo>) mGetBlocks.invoke(contraptionObj);
+    }
+
+    private static float getAngle(Object contraption) throws Exception {
+        ensureContraptionReflection(contraption);
+        return (float) mGetAngle.invoke(contraption, 1.0f);
+    }
+
+    private static Direction.Axis getRotationAxis(Object contraption) {
+        try {
+            ensureContraptionReflection(contraption);
+            Object a = mGetRotationAxis.invoke(contraption);
+            if (a instanceof Direction.Axis ax) return ax;
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static Quaternionf getTiltQuat(Object contraption) {
+        try {
+            ensureContraptionReflection(contraption);
+            Object q = fTiltQuat.get(contraption);
+            if (q instanceof Quaternionf qf) return new Quaternionf(qf);
+        } catch (Throwable ignored) {
+        }
+        return new Quaternionf();
+    }
+
+    private static Direction getDirection(Object contraption) {
+        try {
+            ensureContraptionReflection(contraption);
+            Object d = fDirection.get(contraption);
+            if (d instanceof Direction dir) return dir;
+        } catch (Throwable ignored) {
+        }
+        return Direction.UP;
     }
 
     @Override
@@ -607,6 +918,9 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 lastRotationPerShip.clear();
                 lastRotationTickPerShip.clear();
                 centerOffsetPerShip.clear();
+                subLevelPerShip.clear();
+                bearingPositionsPerShip.clear();
+                contraptionRecs.clear();
             }
         }
     }

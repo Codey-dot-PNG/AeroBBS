@@ -6,17 +6,23 @@ import dev.ryanhcode.sable.sublevel.ServerSubLevel;
 import dev.ryanhcode.sable.sublevel.plot.LevelPlot;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.IntTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtUtils;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -175,6 +181,114 @@ public final class StructureSnapshotService {
 
         } catch (Throwable t) {
             AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to snapshot SubLevel {}: {}", id, t.toString(), t);
+            return null;
+        }
+    }
+
+    /**
+     * Save an arbitrary block map (e.g. a Create contraption's blocks) as a vanilla
+     * structure .nbt - the SAME single-palette format {@link #snapshotShip} produces via
+     * {@code StructureTemplate.save}, so it can back a BBS {@code StructureForm} on the
+     * existing render path.
+     *
+     * <p>The input {@link StructureTemplate.StructureBlockInfo#pos()} keys are treated as
+     * positions in some local frame (for a Create contraption: relative to the contraption
+     * anchor). They are normalised so the saved structure starts at (0,0,0).</p>
+     *
+     * @return the saved file plus the center-bottom anchor expressed in the INPUT (local)
+     *         frame - i.e. the point BBS will place at the form origin, in the same
+     *         coordinates as the input keys (so the caller can transform it to the world).
+     *         Null if there is nothing saveable.
+     */
+    @Nullable
+    public Result snapshotBlockMap(ServerLevel level,
+                                   Map<BlockPos, StructureTemplate.StructureBlockInfo> blocks,
+                                   UUID fileId) {
+        if (level == null || blocks == null || blocks.isEmpty() || fileId == null) return null;
+        try {
+            MinecraftServer server = level.getServer();
+            if (server == null) return null;
+
+            int bminX = Integer.MAX_VALUE, bminY = Integer.MAX_VALUE, bminZ = Integer.MAX_VALUE;
+            int bmaxX = Integer.MIN_VALUE, bmaxY = Integer.MIN_VALUE, bmaxZ = Integer.MIN_VALUE;
+            for (StructureTemplate.StructureBlockInfo info : blocks.values()) {
+                if (info == null || info.pos() == null || info.state() == null) continue;
+                if (info.state().isAir()) continue;
+                BlockPos p = info.pos();
+                bminX = Math.min(bminX, p.getX()); bminY = Math.min(bminY, p.getY()); bminZ = Math.min(bminZ, p.getZ());
+                bmaxX = Math.max(bmaxX, p.getX()); bmaxY = Math.max(bmaxY, p.getY()); bmaxZ = Math.max(bmaxZ, p.getZ());
+            }
+            if (bmaxX < bminX) return null; // no non-air blocks
+
+            int sizeX = bmaxX - bminX + 1, sizeY = bmaxY - bminY + 1, sizeZ = bmaxZ - bminZ + 1;
+
+            // Vanilla single-palette structure NBT: dedupe states into "palette", emit each
+            // block as {pos:[x,y,z], state:idx, nbt:?} with positions normalised to bmin.
+            LinkedHashMap<BlockState, Integer> palette = new LinkedHashMap<>();
+            ListTag blocksTag = new ListTag();
+            for (StructureTemplate.StructureBlockInfo info : blocks.values()) {
+                if (info == null || info.pos() == null || info.state() == null) continue;
+                BlockState state = info.state();
+                if (state.isAir()) continue;
+                Integer idx = palette.get(state);
+                if (idx == null) { idx = palette.size(); palette.put(state, idx); }
+
+                BlockPos p = info.pos();
+                CompoundTag b = new CompoundTag();
+                ListTag posTag = new ListTag();
+                posTag.add(IntTag.valueOf(p.getX() - bminX));
+                posTag.add(IntTag.valueOf(p.getY() - bminY));
+                posTag.add(IntTag.valueOf(p.getZ() - bminZ));
+                b.put("pos", posTag);
+                b.putInt("state", idx);
+                CompoundTag beNbt = info.nbt();
+                if (beNbt != null && !beNbt.isEmpty()) {
+                    CompoundTag copy = beNbt.copy();
+                    copy.remove("x"); copy.remove("y"); copy.remove("z");
+                    b.put("nbt", copy);
+                }
+                blocksTag.add(b);
+            }
+            if (blocksTag.isEmpty()) return null;
+
+            ListTag paletteTag = new ListTag();
+            for (BlockState state : palette.keySet()) {
+                paletteTag.add(NbtUtils.writeBlockState(state));
+            }
+
+            ListTag sizeTag = new ListTag();
+            sizeTag.add(IntTag.valueOf(sizeX));
+            sizeTag.add(IntTag.valueOf(sizeY));
+            sizeTag.add(IntTag.valueOf(sizeZ));
+
+            CompoundTag root = new CompoundTag();
+            root.put("size", sizeTag);
+            root.put("entities", new ListTag());
+            root.put("blocks", blocksTag);
+            root.put("palette", paletteTag);
+
+            File structuresDir = server.getWorldPath(
+                    net.minecraft.world.level.storage.LevelResource.ROOT)
+                    .resolve("generated/minecraft/structures").toFile();
+            structuresDir.mkdirs();
+            Path outFile = structuresDir.toPath().resolve(fileId.toString() + ".nbt");
+            try (FileOutputStream fos = new FileOutputStream(outFile.toFile())) {
+                NbtIo.writeCompressed(root, fos);
+            }
+
+            // Same center-bottom + odd-width parity convention as snapshotShip, but in the
+            // input (local) frame (no world start to add).
+            double parityX = (sizeX % 2 == 1) ? 0.5 : 0.0;
+            double parityZ = (sizeZ % 2 == 1) ? 0.5 : 0.0;
+            double anchorX = (bminX + bmaxX) / 2.0 + parityX;
+            double anchorY = bminY;
+            double anchorZ = (bminZ + bmaxZ) / 2.0 + parityZ;
+
+            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Contraption snapshot {} saved ({} blocks, {}x{}x{})",
+                    outFile.getFileName(), blocksTag.size(), sizeX, sizeY, sizeZ);
+            return new Result(outFile, anchorX, anchorY, anchorZ);
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to snapshot contraption {}: {}", fileId, t.toString(), t);
             return null;
         }
     }

@@ -22,6 +22,18 @@ public final class BridgeConfig {
     public boolean captureAABB = false;
     /** Capture Aeronautics/Sable physics rope polylines per tick into a film side-file. */
     public boolean captureRopes = true;
+    /**
+     * Capture Create propeller-BEARING blade contraptions (the big propellers whose
+     * blades are an assembled, spinning Create contraption rather than a single block).
+     * Their blades are not part of the ship's block grid and are not turned into a Sable
+     * sub-ship, so the normal ship snapshot misses them. When true, each propeller
+     * bearing's blade contraption is captured as its own StructureForm replay and
+     * keyframed to spin (and tilt) about the bearing axis, riding the same render path
+     * as ships. Recording-side; re-record to apply. Fully guarded - a failure here never
+     * affects ship/rope capture. Small single-block propellers are unaffected (they
+     * render via the kinetic BER path).
+     */
+    public boolean captureContraptions = true;
     public String fallbackOutputDir = "aeronauticscml_recordings";
 
     /**
@@ -164,5 +176,6 @@ public final class BridgeConfig {
     public boolean captureVelocity() { return captureVelocity; }
     public boolean captureAABB() { return captureAABB; }
     public boolean captureRopes() { return captureRopes; }
+    public boolean captureContraptions() { return captureContraptions; }
     public String fallbackOutputDir() { return fallbackOutputDir; }
 }
