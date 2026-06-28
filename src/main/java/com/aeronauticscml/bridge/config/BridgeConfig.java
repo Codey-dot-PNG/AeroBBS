@@ -34,6 +34,17 @@ public final class BridgeConfig {
      * render via the kinetic BER path).
      */
     public boolean captureContraptions = true;
+    /**
+     * EXPERIMENTAL (recording-side, default OFF). Capture block changes on a ship mid-recording
+     * (blocks placed/broken/changed) and replay them. The ship is re-snapshotted into a new
+     * "generation" StructureForm whenever its blocks change; each generation is keyframed
+     * visible (scale 1) only during its time window and hidden (scale 0) otherwise, so the
+     * replay shows the correct block state over time. Requires a re-record. Off by default
+     * because it adds a periodic full re-scan of the ship and is still experimental.
+     */
+    public boolean captureBlockUpdates = false;
+    /** How often (ticks) to re-scan a ship for block changes when captureBlockUpdates is on. */
+    public int blockUpdateIntervalTicks = 10;
     public String fallbackOutputDir = "aeronauticscml_recordings";
 
     /**
@@ -177,5 +188,7 @@ public final class BridgeConfig {
     public boolean captureAABB() { return captureAABB; }
     public boolean captureRopes() { return captureRopes; }
     public boolean captureContraptions() { return captureContraptions; }
+    public boolean captureBlockUpdates() { return captureBlockUpdates; }
+    public int blockUpdateIntervalTicks() { return Math.max(1, blockUpdateIntervalTicks); }
     public String fallbackOutputDir() { return fallbackOutputDir; }
 }

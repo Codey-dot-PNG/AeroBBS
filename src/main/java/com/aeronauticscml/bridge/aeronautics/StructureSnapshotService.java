@@ -52,6 +52,18 @@ public final class StructureSnapshotService {
         if (ship == null) return null;
         UUID id = ship.getUniqueId();
         if (id == null) return null;
+        return snapshotShip(ship, id.toString());
+    }
+
+    /**
+     * Snapshot a ship to a specific structure file id. Block-update generations use this to
+     * write each generation to its own "&lt;fileId&gt;.nbt" while keeping the same ship.
+     */
+    @Nullable
+    public Result snapshotShip(ServerSubLevel ship, String fileId) {
+        if (ship == null || fileId == null) return null;
+        UUID id = ship.getUniqueId();
+        if (id == null) return null;
 
         try {
             Level subLevelLevel = ship.getLevel();
@@ -116,7 +128,7 @@ public final class StructureSnapshotService {
                     net.minecraft.world.level.storage.LevelResource.ROOT)
                     .resolve("generated/minecraft/structures").toFile();
             structuresDir.mkdirs();
-            Path outFile = structuresDir.toPath().resolve(id.toString() + ".nbt");
+            Path outFile = structuresDir.toPath().resolve(fileId + ".nbt");
 
             StructureTemplate template = new StructureTemplate();
             BlockPos worldStart = new BlockPos(startX, startY, startZ);
@@ -290,6 +302,40 @@ public final class StructureSnapshotService {
         } catch (Throwable t) {
             AeronauticsCmlBridge.LOGGER.error("[aeronauticscml] Failed to snapshot contraption {}: {}", fileId, t.toString(), t);
             return null;
+        }
+    }
+
+    /**
+     * A cheap order-stable hash of a ship's non-air blocks (position + block-state id),
+     * for detecting block changes mid-recording without writing a file. Air is skipped, so
+     * additions, removals and changes all alter the hash. Returns 0 on any failure (treated
+     * by the caller as "no change").
+     */
+    public long contentHash(ServerSubLevel ship) {
+        try {
+            if (ship == null) return 0L;
+            ship.updateBoundingBox();
+            LevelPlot plot = ship.getPlot();
+            if (plot == null) return 0L;
+            if (!(ship.getLevel() instanceof ServerLevel level)) return 0L;
+            BoundingBox3ic b = plot.getBoundingBox();
+
+            long h = 1125899906842597L;
+            BlockPos.MutableBlockPos mp = new BlockPos.MutableBlockPos();
+            for (int y = b.minY(); y <= b.maxY(); y++) {
+                for (int z = b.minZ(); z <= b.maxZ(); z++) {
+                    for (int x = b.minX(); x <= b.maxX(); x++) {
+                        net.minecraft.world.level.block.state.BlockState st = level.getBlockState(mp.set(x, y, z));
+                        if (st.isAir()) continue;
+                        long posKey = (((long) x * 73856093L) ^ ((long) y * 19349663L) ^ ((long) z * 83492791L));
+                        h = h * 1099511628211L + posKey;
+                        h = h * 1099511628211L + net.minecraft.world.level.block.Block.getId(st);
+                    }
+                }
+            }
+            return h;
+        } catch (Throwable t) {
+            return 0L;
         }
     }
 }

@@ -119,6 +119,10 @@ public final class RealCmlRecorder implements ICmlRecorder {
     private final Map<UUID, List<BlockPos>> bearingPositionsPerShip = new HashMap<>();
     /** Per blade-contraption (keyed by its entity uuid): its replay/form + local anchor. */
     private final Map<UUID, ContraptionRec> contraptionRecs = new HashMap<>();
+    /** Block-update generations: last content hash, generation count, and last check tick per ship. */
+    private final Map<UUID, Long> genHashPerShip = new HashMap<>();
+    private final Map<UUID, Integer> genCountPerShip = new HashMap<>();
+    private final Map<UUID, Long> lastGenCheckPerShip = new HashMap<>();
     private final StructureSnapshotService snapshotService = new StructureSnapshotService();
 
     /** A captured propeller blade contraption: its BBS replay/form and center-bottom anchor (contraption-local frame). */
@@ -174,6 +178,8 @@ public final class RealCmlRecorder implements ICmlRecorder {
     private int rotationSubdivisions = 1;
     private boolean alignStructureToCenter = true;
     private boolean captureContraptions = true;
+    private boolean captureBlockUpdates;
+    private int blockUpdateIntervalTicks = 10;
     private double renderOffsetX, renderOffsetY, renderOffsetZ;
     private int debugCounter;
 
@@ -207,6 +213,9 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 subLevelPerShip.clear();
                 bearingPositionsPerShip.clear();
                 contraptionRecs.clear();
+                genHashPerShip.clear();
+                genCountPerShip.clear();
+                lastGenCheckPerShip.clear();
                 ropeFilesPerShip.clear();
                 anchorPoseThisTick.clear();
                 primaryShipId = null;
@@ -217,6 +226,8 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 rotationSubdivisions = clampSubdivisions(cfg.rotationSubdivisions());
                 alignStructureToCenter = cfg.alignStructureToCenter();
                 captureContraptions = cfg.captureContraptions();
+                captureBlockUpdates = cfg.captureBlockUpdates();
+                blockUpdateIntervalTicks = cfg.blockUpdateIntervalTicks();
                 renderOffsetX = cfg.renderOffsetX();
                 renderOffsetY = cfg.renderOffsetY();
                 renderOffsetZ = cfg.renderOffsetZ();
@@ -263,6 +274,16 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 // the world position of the structure's center-bottom anchor (what BBS places
                 // at the form origin), not the raw physics origin, so the replay lines up.
                 float tickF = (float) relativeTick;
+
+                // Block updates: if the ship's blocks changed, roll to a new generation form
+                // (old one keyframed hidden from here, new one shown). Must run before this
+                // tick's keyframes so they are written to the new generation. No-op unless
+                // captureBlockUpdates is on.
+                if (captureBlockUpdates) {
+                    Replay rolled = maybeRollGeneration(pose, tickF, relativeTick);
+                    if (rolled != null) replay = rolled;
+                }
+
                 Vec3 worldPos = computeAnchorWorldPosition(pose);
                 replay.keyframes.x.insert(tickF, worldPos.x);
                 replay.keyframes.y.insert(tickF, worldPos.y);
@@ -650,6 +671,87 @@ public final class RealCmlRecorder implements ICmlRecorder {
         }
     }
 
+    // ---- Block-update generations ---------------------------------------------------
+
+    /**
+     * If enough ticks have passed and the ship's blocks have changed since the active
+     * generation, snapshot a NEW generation form, keyframe the old one hidden (scale 0)
+     * from this tick and the new one shown from this tick (hidden before), repoint the
+     * ship's replay/form to the new generation, and return it. Returns null if no roll.
+     *
+     * <p>Visibility uses the transform property's scale: BBS applies it (scaleStack), so
+     * a scale-0 keyframe collapses the form to nothing - a reliable per-tick hide without
+     * relying on alpha. Each generation's own .nbt keeps the same ship uuid prefix so its
+     * ropes/kinetics still resolve (the rope store strips the "-g&lt;n&gt;" suffix).</p>
+     */
+    private Replay maybeRollGeneration(ShipPose pose, float tickF, long relativeTick) {
+        UUID shipId = pose.shipId();
+        Long lastCheck = lastGenCheckPerShip.get(shipId);
+        if (lastCheck != null && (relativeTick - lastCheck) < blockUpdateIntervalTicks) {
+            return null;
+        }
+        lastGenCheckPerShip.put(shipId, relativeTick);
+
+        try {
+            ServerSubLevel sl = findSubLevel(pose);
+            if (sl == null) return null;
+            long hash = snapshotService.contentHash(sl);
+            if (hash == 0L) return null; // hashing failed - don't roll on bad data
+            Long prev = genHashPerShip.get(shipId);
+            if (prev == null) { genHashPerShip.put(shipId, hash); return null; } // baseline
+            if (hash == prev) return null; // unchanged
+            genHashPerShip.put(shipId, hash);
+
+            Replay oldReplay = replayPerShip.get(shipId);
+            StructureForm oldForm = formPerShip.get(shipId);
+            if (oldReplay == null || oldForm == null) return null;
+
+            int gen = genCountPerShip.merge(shipId, 1, Integer::sum);
+            String fileId = shipId + "-g" + gen;
+            StructureSnapshotService.Result snap = snapshotService.snapshotShip(sl, fileId);
+            if (snap == null) return null;
+            StructureForm newForm = createStructureForm(snap.file());
+            if (newForm == null) return null;
+
+            // Hide the outgoing generation from this tick on.
+            insertHiddenKeyframe(oldReplay.properties.getOrCreate(oldForm, "transform"), tickF);
+
+            // New generation: recompute the anchor offset for the changed geometry, hide it
+            // before now; the normal rotation keyframe written right after shows it (scale 1).
+            computeAndStoreCenterOffset(pose, sl, snap);
+            Replay newReplay = film.replays.addReplay();
+            newReplay.label.set(pose.shipName() + " g" + gen);
+            newReplay.uuid.set(fileId);
+            newReplay.form.set(newForm);
+            insertHiddenKeyframe(newReplay.properties.getOrCreate(newForm, "transform"), 0F);
+
+            replayPerShip.put(shipId, newReplay);
+            formPerShip.put(shipId, newForm);
+            structureFilePerShip.put(shipId, snap.file());
+            // Start the new transform channel's rotation-subdivision tracking clean.
+            lastRotationPerShip.remove(shipId);
+            lastRotationTickPerShip.remove(shipId);
+
+            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Ship {} blocks changed -> generation {} ({})",
+                    shipId, gen, snap.file().getFileName());
+            return newReplay;
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] block-update generation roll failed for {}: {}", shipId, t.toString());
+            return null;
+        }
+    }
+
+    /** Insert a CONST keyframe that hides a form by collapsing its transform scale to 0. */
+    private static void insertHiddenKeyframe(KeyframeChannel channel, float tick) {
+        Transform t = new Transform();
+        t.scale.set(0F, 0F, 0F);
+        int index = channel.insert(tick, t);
+        Keyframe kf = channel.get(index);
+        if (kf != null) {
+            kf.getInterpolation().setInterp(Interpolations.CONST);
+        }
+    }
+
     // ---- Propeller-bearing blade contraption capture --------------------------------
 
     /**
@@ -921,6 +1023,9 @@ public final class RealCmlRecorder implements ICmlRecorder {
                 subLevelPerShip.clear();
                 bearingPositionsPerShip.clear();
                 contraptionRecs.clear();
+                genHashPerShip.clear();
+                genCountPerShip.clear();
+                lastGenCheckPerShip.clear();
             }
         }
     }

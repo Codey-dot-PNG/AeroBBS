@@ -70,6 +70,7 @@ public final class RopeDataStore {
      * by {@code alpha}.
      */
     public static Frame frameAt(String shipUuid, float tickF) {
+        shipUuid = stripGeneration(shipUuid); // block-update generation forms keep the ship's rope file
         Entry e = entry(shipUuid);
         if (e == null || e.file == null || e.file.ticks == null || e.sortedTicks == null || e.sortedTicks.length == 0) {
             return null;
@@ -140,6 +141,23 @@ public final class RopeDataStore {
             AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] Failed to read rope side-file for '{}': {}", shipUuid, t.toString());
             return e;
         }
+    }
+
+    /**
+     * Block-update generation forms are keyed "&lt;shipUuid&gt;-g&lt;n&gt;" but share the ship's
+     * single rope side-file (&lt;shipUuid&gt;.json). Strip a trailing "-g&lt;digits&gt;" so they
+     * resolve to it. A UUID never contains "-g", so this is unambiguous.
+     */
+    private static String stripGeneration(String uuid) {
+        if (uuid == null) return null;
+        int i = uuid.lastIndexOf("-g");
+        if (i > 0 && i + 2 < uuid.length()) {
+            for (int k = i + 2; k < uuid.length(); k++) {
+                if (!Character.isDigit(uuid.charAt(k))) return uuid;
+            }
+            return uuid.substring(0, i);
+        }
+        return uuid;
     }
 
     private static int[] computeSortedTicks(RopeFile f) {
