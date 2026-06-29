@@ -194,18 +194,21 @@ public final class KineticReplayRenderer {
                 continue;
             }
 
-            // Balance the pose with try/finally: a BER that throws mid-render must not
-            // leave the shared PoseStack unbalanced (would corrupt later rendering).
-            stack.pushPose();
+            // Render each BE into an ISOLATED PoseStack copied from the current transform, so a
+            // foreign/buggy BER that leaks a push (e.g. throws mid-render after pushing, common
+            // when third-party BERs run in our virtual-level context) can NEVER unbalance the
+            // shared world PoseStack - that would crash the whole frame with "Pose stack not
+            // empty". Critical now that renderAllBlockEntities draws arbitrary third-party BERs.
             try {
+                PoseStack isolated = new PoseStack();
+                isolated.last().pose().set(stack.last().pose());
+                isolated.last().normal().set(stack.last().normal());
                 // Same per-block centering BBS uses: (localPos - pivot).
-                stack.translate(p.pos.getX() - model.pivotX, p.pos.getY() - model.pivotY, p.pos.getZ() - model.pivotZ);
-                renderer.render(p.be, partial, stack, consumers, light, OverlayTexture.NO_OVERLAY);
+                isolated.translate(p.pos.getX() - model.pivotX, p.pos.getY() - model.pivotY, p.pos.getZ() - model.pivotZ);
+                renderer.render(p.be, partial, isolated, consumers, light, OverlayTexture.NO_OVERLAY);
                 drawn++;
             } catch (Throwable t) {
                 diag("render failed for " + p.be.getClass().getSimpleName() + ": " + t);
-            } finally {
-                stack.popPose();
             }
         }
 

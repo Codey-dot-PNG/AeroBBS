@@ -160,24 +160,28 @@ public final class ReplayContraptionRenderer {
     private static void drawMarker(PoseStack stack, VertexConsumer vc, Vec3 cam,
                                    double worldX, double worldY, double worldZ, Transform transform) {
         stack.pushPose();
-        stack.translate(worldX - cam.x, worldY - cam.y, worldZ - cam.z);
+        // try/finally so an exception mid-draw can never leave the world PoseStack unbalanced
+        // ("Pose stack not empty" crash at frame end).
+        try {
+            stack.translate(worldX - cam.x, worldY - cam.y, worldZ - cam.z);
 
-        // World-up mast (not rotated) - clears the hull into open sky.
-        solidBox(stack, vc, -0.15F, 0F, -0.15F, 0.15F, 24F, 0.15F, 1F, 0F, 1F);
-        solidBox(stack, vc, -0.4F, -0.4F, -0.4F, 0.4F, 0.4F, 0.4F, 1F, 1F, 1F);
+            // World-up mast (not rotated) - clears the hull into open sky.
+            solidBox(stack, vc, -0.15F, 0F, -0.15F, 0.15F, 24F, 0.15F, 1F, 0F, 1F);
+            solidBox(stack, vc, -0.4F, -0.4F, -0.4F, 0.4F, 0.4F, 0.4F, 1F, 1F, 1F);
 
-        if (transform != null) {
-            stack.mulPose(Axis.ZP.rotation(transform.rotate.z));
-            stack.mulPose(Axis.YP.rotation(transform.rotate.y));
-            stack.mulPose(Axis.XP.rotation(transform.rotate.x));
-            stack.mulPose(Axis.ZP.rotation(transform.rotate2.z));
-            stack.mulPose(Axis.YP.rotation(transform.rotate2.y));
-            stack.mulPose(Axis.XP.rotation(transform.rotate2.x));
+            if (transform != null) {
+                stack.mulPose(Axis.ZP.rotation(transform.rotate.z));
+                stack.mulPose(Axis.YP.rotation(transform.rotate.y));
+                stack.mulPose(Axis.XP.rotation(transform.rotate.x));
+                stack.mulPose(Axis.ZP.rotation(transform.rotate2.z));
+                stack.mulPose(Axis.YP.rotation(transform.rotate2.y));
+                stack.mulPose(Axis.XP.rotation(transform.rotate2.x));
+            }
+            solidBox(stack, vc, -0.12F, -0.12F, 0F, 0.12F, 0.12F, 6F, 0.2F, 1F, 0.2F); // +Z forward (green)
+            solidBox(stack, vc, 0F, -0.12F, -0.12F, 6F, 0.12F, 0.12F, 1F, 0.3F, 0.3F); // +X right (red)
+        } finally {
+            stack.popPose();
         }
-        solidBox(stack, vc, -0.12F, -0.12F, 0F, 0.12F, 0.12F, 6F, 0.2F, 1F, 0.2F); // +Z forward (green)
-        solidBox(stack, vc, 0F, -0.12F, -0.12F, 6F, 0.12F, 0.12F, 1F, 0.3F, 0.3F); // +X right (red)
-
-        stack.popPose();
     }
 
     /**
