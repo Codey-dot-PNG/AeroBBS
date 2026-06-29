@@ -43,6 +43,23 @@ public final class BridgeConfig {
      */
     public boolean captureContraptions = true;
     /**
+     * Compatibility for "camo" blocks that mimic another block (Copycats+, Extra Copycats,
+     * FramedBlocks, Create copycats). BBS renders a static baked mesh with no model data, so
+     * these otherwise show as blank frames. When true, the recorder substitutes each camo
+     * block in the snapshot with the block state it is mimicking, so BBS renders the right
+     * appearance directly. Full-block camos look exact; shaped framed/copycat blocks (slabs,
+     * stairs) render as the material's full cube (material correct, shape approximated).
+     * Recording-side; re-record to apply.
+     */
+    public boolean substituteCamoBlocks = true;
+    /**
+     * EXPERIMENTAL (client, default OFF). In the kinetic render path, also draw NON-kinetic
+     * block entities that have a BlockEntityRenderer (e.g. Burnt's Basic flags, chests, signs)
+     * so their animated/BER parts show in the replay, not just the static model. Needs
+     * experimentalKineticRender on. Heavier (renders every BER block); leave off unless wanted.
+     */
+    public boolean renderAllBlockEntities = false;
+    /**
      * EXPERIMENTAL (recording-side, default OFF). Capture block changes on a ship mid-recording
      * (blocks placed/broken/changed) and replay them. The ship is re-snapshotted into a new
      * "generation" StructureForm whenever its blocks change; each generation is keyframed
@@ -197,6 +214,8 @@ public final class BridgeConfig {
     public boolean captureRopes() { return captureRopes; }
     public int ropeRecordIntervalTicks() { return Math.max(1, ropeRecordIntervalTicks); }
     public boolean captureContraptions() { return captureContraptions; }
+    public boolean substituteCamoBlocks() { return substituteCamoBlocks; }
+    public boolean renderAllBlockEntities() { return renderAllBlockEntities; }
     public boolean captureBlockUpdates() { return captureBlockUpdates; }
     public int blockUpdateIntervalTicks() { return Math.max(1, blockUpdateIntervalTicks); }
     public String fallbackOutputDir() { return fallbackOutputDir; }

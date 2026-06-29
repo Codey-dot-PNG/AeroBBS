@@ -287,6 +287,10 @@ public final class KineticReplayRenderer {
         m.virtual = virtual;
 
         HolderLookup.Provider registries = client.registryAccess();
+        // Optionally also draw NON-kinetic BEs that have a renderer (Burnt's Basic flags,
+        // chests, signs, ...) so their BER parts show, not just the static model.
+        boolean allBEs = BridgeConfig.load().renderAllBlockEntities();
+        BlockEntityRenderDispatcher beDispatcher = Minecraft.getInstance().getBlockEntityRenderDispatcher();
         int kineticCount = 0;
         int propellerCount = 0;
         int beWithNbt = 0;
@@ -297,10 +301,17 @@ public final class KineticReplayRenderer {
             beWithNbt++;
             try {
                 BlockEntity be = BlockEntity.loadStatic(e.pos, e.state, e.beNbt, registries);
-                if (be == null || !kineticBeClass.isInstance(be)) {
-                    continue; // only Create kinetics (shafts/cogs/gearboxes + propellers)
+                if (be == null) {
+                    continue;
+                }
+                boolean kinetic = kineticBeClass.isInstance(be);
+                if (!kinetic && !allBEs) {
+                    continue; // by default only Create kinetics (shafts/cogs/gearboxes + propellers)
                 }
                 be.setLevel(virtual);
+                if (!kinetic && beDispatcher.getRenderer(be) == null) {
+                    continue; // non-kinetic BE with nothing to draw
+                }
                 beMap.put(e.pos, be);
                 m.placed.add(new Placed(e.pos, be));
                 kineticCount++;

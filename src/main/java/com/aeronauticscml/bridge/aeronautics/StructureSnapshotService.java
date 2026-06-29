@@ -4,23 +4,32 @@ import com.aeronauticscml.bridge.mod.AeronauticsCmlBridge;
 import dev.ryanhcode.sable.companion.math.BoundingBox3ic;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
 import dev.ryanhcode.sable.sublevel.plot.LevelPlot;
+import com.aeronauticscml.bridge.config.BridgeConfig;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.IntTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtUtils;
+import net.minecraft.nbt.Tag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.lang.reflect.Method;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -143,6 +152,12 @@ public final class StructureSnapshotService {
             if (!hasAnyBlock) {
                 AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] SubLevel {} snapshot is empty - skipping", id);
                 return null;
+            }
+
+            // Camo-block compatibility: swap Copycats/FramedBlocks/etc. blocks for the block
+            // they mimic, so BBS's model-data-less static mesh shows the right appearance.
+            if (BridgeConfig.load().substituteCamoBlocks()) {
+                applyCamoSubstitution(tag, serverLevel.registryAccess());
             }
 
             try (FileOutputStream fos = new FileOutputStream(outFile.toFile())) {
@@ -336,6 +351,93 @@ public final class StructureSnapshotService {
             return h;
         } catch (Throwable t) {
             return 0L;
+        }
+    }
+
+    private static final java.util.Set<String> CAMO_NAMESPACES =
+            java.util.Set.of("copycats", "extra_copycats", "framedblocks", "create");
+
+    /**
+     * Replace camo blocks (Copycats/FramedBlocks/etc.) in a saved structure tag with the
+     * block state they mimic, so BBS's static render shows the right appearance. Only blocks
+     * in known camo namespaces with a non-empty mimic state are changed; everything else is
+     * left untouched. Fully guarded.
+     */
+    private void applyCamoSubstitution(CompoundTag tag, HolderLookup.Provider registries) {
+        try {
+            if (!tag.contains("blocks", Tag.TAG_LIST) || !tag.contains("palette", Tag.TAG_LIST)) return;
+            ListTag palette = tag.getList("palette", Tag.TAG_COMPOUND);
+            ListTag blocks = tag.getList("blocks", Tag.TAG_COMPOUND);
+            if (palette.isEmpty() || blocks.isEmpty()) return;
+            HolderLookup.RegistryLookup<Block> blockLookup = registries.lookupOrThrow(Registries.BLOCK);
+
+            Map<String, Integer> paletteIndex = new HashMap<>();
+            for (int i = 0; i < palette.size(); i++) paletteIndex.put(palette.getCompound(i).toString(), i);
+
+            int substituted = 0;
+            for (int i = 0; i < blocks.size(); i++) {
+                CompoundTag b = blocks.getCompound(i);
+                if (!b.contains("nbt", Tag.TAG_COMPOUND)) continue;
+                int stateIdx = b.getInt("state");
+                if (stateIdx < 0 || stateIdx >= palette.size()) continue;
+
+                BlockState state = NbtUtils.readBlockState(blockLookup, palette.getCompound(stateIdx));
+                if (state == null || state.isAir()) continue;
+                String ns = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getNamespace();
+                if (!CAMO_NAMESPACES.contains(ns)) continue;
+
+                ListTag posTag = b.getList("pos", Tag.TAG_INT);
+                BlockPos pos = posTag.size() >= 3
+                        ? new BlockPos(posTag.getInt(0), posTag.getInt(1), posTag.getInt(2)) : BlockPos.ZERO;
+                BlockEntity be = BlockEntity.loadStatic(pos, state, b.getCompound("nbt"), registries);
+                if (be == null) continue;
+                BlockState camo = extractCamoState(be);
+                if (camo == null || camo.isAir() || camo == state) continue;
+
+                CompoundTag camoTag = NbtUtils.writeBlockState(camo);
+                String key = camoTag.toString();
+                Integer idx = paletteIndex.get(key);
+                if (idx == null) {
+                    idx = palette.size();
+                    palette.add(camoTag);
+                    paletteIndex.put(key, idx);
+                }
+                b.putInt("state", idx);
+                b.remove("nbt"); // the mimicked block has no camo block-entity
+                substituted++;
+            }
+            if (substituted > 0) {
+                AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] Camo substitution: {} block(s) replaced with their material", substituted);
+            }
+        } catch (Throwable t) {
+            AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] Camo substitution failed: {}", t.toString());
+        }
+    }
+
+    /** The block state a camo block-entity is mimicking (Copycats getMaterial / FramedBlocks getCamo), or null. */
+    private static BlockState extractCamoState(BlockEntity be) {
+        // Copycats / Create copycats: BlockState getMaterial()
+        Object material = invokeNoArg(be, "getMaterial");
+        if (material instanceof BlockState bs) return bs;
+        // FramedBlocks: getCamo().getContent().getState()
+        Object container = invokeNoArg(be, "getCamo");
+        if (container != null) {
+            Object content = invokeNoArg(container, "getContent");
+            if (content != null) {
+                Object st = invokeNoArg(content, "getState");
+                if (st instanceof BlockState bs) return bs;
+            }
+        }
+        return null;
+    }
+
+    private static Object invokeNoArg(Object target, String method) {
+        if (target == null) return null;
+        try {
+            Method m = target.getClass().getMethod(method);
+            return m.invoke(target);
+        } catch (Throwable t) {
+            return null;
         }
     }
 }
