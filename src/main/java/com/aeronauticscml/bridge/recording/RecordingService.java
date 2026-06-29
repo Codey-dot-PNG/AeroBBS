@@ -98,9 +98,13 @@ public final class RecordingService {
         if (recorder == null || !recorder.isRecording()) return;
 
         if (sessionStartTick < 0) sessionStartTick = tick;
-        // Skip ticks to enforce the configured capture cadence.
+        // Frames and ropes have independent cadences: ropes can be sampled more often than
+        // ship frames (default every tick) so they stay smooth.
         int interval = Math.max(1, config.recordIntervalTicks());
-        if ((tick - sessionStartTick) % interval != 0) return;
+        int ropeInterval = Math.max(1, config.ropeRecordIntervalTicks());
+        boolean frameTick = (tick - sessionStartTick) % interval == 0;
+        boolean ropeTick = config.captureRopes() && (tick - sessionStartTick) % ropeInterval == 0;
+        if (!frameTick && !ropeTick) return;
 
         List<String> whitelist = config.shipWhitelist();
         boolean captureVelocity = config.captureVelocity();
@@ -108,25 +112,29 @@ public final class RecordingService {
 
         int capturedThisTick = 0;
         for (Level level : levels) {
-            List<Object> ships;
-            try {
-                ships = provider.shipsInLevel(level);
-            } catch (Throwable t) {
-                AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] shipsInLevel threw for {}: {}", level, t.toString());
-                continue;
-            }
-            for (Object shipHandle : ships) {
-                ShipPose pose = provider.snapshot(shipHandle, tick, captureVelocity, captureAABB);
-                if (pose == null) continue;
-                if (!passesWhitelist(pose, whitelist)) continue;
-                recorder.recordFrame(pose);
-                framesPerShip.merge(pose.shipId(), 1L, Long::sum);
-                totalFramesThisSession++;
-                capturedThisTick++;
+            if (frameTick) {
+                List<Object> ships;
+                try {
+                    ships = provider.shipsInLevel(level);
+                } catch (Throwable t) {
+                    AeronauticsCmlBridge.LOGGER.debug("[aeronauticscml] shipsInLevel threw for {}: {}", level, t.toString());
+                    ships = null;
+                }
+                if (ships != null) {
+                    for (Object shipHandle : ships) {
+                        ShipPose pose = provider.snapshot(shipHandle, tick, captureVelocity, captureAABB);
+                        if (pose == null) continue;
+                        if (!passesWhitelist(pose, whitelist)) continue;
+                        recorder.recordFrame(pose);
+                        framesPerShip.merge(pose.shipId(), 1L, Long::sum);
+                        totalFramesThisSession++;
+                        capturedThisTick++;
+                    }
+                }
             }
 
-            // Ropes are level-wide physics objects, not per-ship: capture once per level.
-            if (config.captureRopes() && level instanceof ServerLevel serverLevel) {
+            // Ropes are level-wide physics objects, captured on their own cadence.
+            if (ropeTick && level instanceof ServerLevel serverLevel) {
                 try {
                     recorder.recordRopes(serverLevel, tick);
                 } catch (Throwable t) {

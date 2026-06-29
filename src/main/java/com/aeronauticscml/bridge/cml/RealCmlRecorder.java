@@ -360,7 +360,11 @@ public final class RealCmlRecorder implements ICmlRecorder {
 
                     RopeFile rf = ropeFilesPerShip.computeIfAbsent(owner, k -> new RopeFile());
                     rf.ticks.computeIfAbsent(tickKey, k -> new ArrayList<>()).add(snap);
-                    double[] pose = anchorPoseThisTick.get(owner);
+                    // Compute the owner ship's anchor pose LIVE for this tick (ropes can be
+                    // sampled on ticks where recordFrame didn't run); fall back to the last
+                    // frame's stashed pose.
+                    double[] pose = computeAnchorPoseNow(owner);
+                    if (pose == null) pose = anchorPoseThisTick.get(owner);
                     if (pose != null) rf.poses.put(tickKey, pose);
                     any = true;
                 }
@@ -474,6 +478,33 @@ public final class RealCmlRecorder implements ICmlRecorder {
         Quaterniond q = new Quaterniond(wr.x, wr.y, wr.z, wr.w).normalize();
         q.transform(local); // body-frame -> world-frame
         return new Vec3(p.x() + local.x, p.y() + local.y, p.z() + local.z);
+    }
+
+    /**
+     * Compute a ship's center-bottom anchor world pose {@code [x,y,z, qx,qy,qz,qw]} from its
+     * LIVE sublevel pose + cached center offset, for rope ticks that don't coincide with a
+     * recorded frame. Returns null if the ship's sublevel/offset isn't known yet (then the
+     * caller falls back to the last frame's pose).
+     */
+    private double[] computeAnchorPoseNow(UUID owner) {
+        try {
+            ServerSubLevel sl = subLevelPerShip.get(owner);
+            if (sl == null) return null;
+            Pose3dc lp = sl.logicalPose();
+            if (lp == null) return null;
+            Vector3dc p = lp.position();
+            Quaterniondc r = lp.orientation();
+            double wx = p.x(), wy = p.y(), wz = p.z();
+            Vector3d d = centerOffsetPerShip.get(owner);
+            if (alignStructureToCenter && d != null) {
+                Vector3d local = new Vector3d(d.x + renderOffsetX, d.y + renderOffsetY, d.z + renderOffsetZ);
+                new Quaterniond(r.x(), r.y(), r.z(), r.w()).normalize().transform(local);
+                wx += local.x; wy += local.y; wz += local.z;
+            }
+            return new double[]{wx, wy, wz, r.x(), r.y(), r.z(), r.w()};
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /**

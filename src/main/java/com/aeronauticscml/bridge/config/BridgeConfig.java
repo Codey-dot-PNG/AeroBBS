@@ -20,8 +20,16 @@ public final class BridgeConfig {
     public int recordIntervalTicks = 1;
     public boolean captureVelocity = true;
     public boolean captureAABB = false;
-    /** Capture Aeronautics/Sable physics rope polylines per tick into a film side-file. */
+    /** Capture Aeronautics/Sable physics rope polylines into a film side-file. */
     public boolean captureRopes = true;
+    /**
+     * How often (in ticks) to sample ropes, independent of recordIntervalTicks. Default 1
+     * (every server tick = 20 Hz, the max) so ropes stay smooth even when frames are
+     * recorded less often. Lower than recordIntervalTicks gives more rope samples than ship
+     * frames (e.g. frames every 3 ticks but ropes every tick = 3x rope frequency). The rope
+     * anchor pose is computed live each rope-tick, so off-frame ticks stay aligned.
+     */
+    public int ropeRecordIntervalTicks = 1;
     /**
      * Capture Create propeller-BEARING blade contraptions (the big propellers whose
      * blades are an assembled, spinning Create contraption rather than a single block).
@@ -187,6 +195,7 @@ public final class BridgeConfig {
     public boolean captureVelocity() { return captureVelocity; }
     public boolean captureAABB() { return captureAABB; }
     public boolean captureRopes() { return captureRopes; }
+    public int ropeRecordIntervalTicks() { return Math.max(1, ropeRecordIntervalTicks); }
     public boolean captureContraptions() { return captureContraptions; }
     public boolean captureBlockUpdates() { return captureBlockUpdates; }
     public int blockUpdateIntervalTicks() { return Math.max(1, blockUpdateIntervalTicks); }
