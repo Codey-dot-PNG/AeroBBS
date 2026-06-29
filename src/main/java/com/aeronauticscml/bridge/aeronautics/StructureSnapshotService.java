@@ -154,9 +154,11 @@ public final class StructureSnapshotService {
                 return null;
             }
 
-            // Camo-block compatibility: swap Copycats/FramedBlocks/etc. blocks for the block
-            // they mimic, so BBS's model-data-less static mesh shows the right appearance.
-            if (BridgeConfig.load().substituteCamoBlocks()) {
+            // Camo-block compatibility (recording-side fallback): swap Copycats/FramedBlocks
+            // blocks for the block they mimic. Skipped when renderCamoBlocks is on - then the
+            // client render-hook draws them with model data instead (keeps their shape), and we
+            // must leave the camo blocks in the snapshot for it to find.
+            if (BridgeConfig.load().substituteCamoBlocks() && !BridgeConfig.load().renderCamoBlocks()) {
                 applyCamoSubstitution(tag, serverLevel.registryAccess());
             }
 
@@ -355,7 +357,7 @@ public final class StructureSnapshotService {
     }
 
     private static final java.util.Set<String> CAMO_NAMESPACES =
-            java.util.Set.of("copycats", "extra_copycats", "framedblocks", "create");
+            java.util.Set.of("copycats", "extra_copycats", "aerocopycats", "framedblocks", "create");
 
     /**
      * Replace camo blocks (Copycats/FramedBlocks/etc.) in a saved structure tag with the

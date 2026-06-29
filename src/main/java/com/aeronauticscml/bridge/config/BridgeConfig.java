@@ -60,6 +60,16 @@ public final class BridgeConfig {
      */
     public boolean renderAllBlockEntities = false;
     /**
+     * Render camo blocks (Copycats+, Extra/Aero Copycats, FramedBlocks, Create copycats) by
+     * drawing their block MODEL with the block-entity's NeoForge model data in the virtual
+     * level (like the kinetic BER path, but model-data-driven) - so they show the camo material
+     * AND keep their shape. BBS's static mesh renders them empty (no model data), so this is
+     * what actually makes them appear. Render-side, no re-record. When on, the recording-side
+     * camo SUBSTITUTION is skipped (the two are alternatives). Needs experimentalKineticRender
+     * OR this on. No-op if the NeoForge model-data API isn't present.
+     */
+    public boolean renderCamoBlocks = true;
+    /**
      * EXPERIMENTAL (recording-side, default OFF). Capture block changes on a ship mid-recording
      * (blocks placed/broken/changed) and replay them. The ship is re-snapshotted into a new
      * "generation" StructureForm whenever its blocks change; each generation is keyframed
@@ -216,6 +226,7 @@ public final class BridgeConfig {
     public boolean captureContraptions() { return captureContraptions; }
     public boolean substituteCamoBlocks() { return substituteCamoBlocks; }
     public boolean renderAllBlockEntities() { return renderAllBlockEntities; }
+    public boolean renderCamoBlocks() { return renderCamoBlocks; }
     public boolean captureBlockUpdates() { return captureBlockUpdates; }
     public int blockUpdateIntervalTicks() { return Math.max(1, blockUpdateIntervalTicks); }
     public String fallbackOutputDir() { return fallbackOutputDir; }

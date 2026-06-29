@@ -59,6 +59,17 @@ public final class KineticReplayRenderer {
     private static Field bearingAngleField;         // MechanicalBearingBlockEntity.angle (protected base field)
     private static Field bearingPrevAngleField;     // PropellerBearingBlockEntity.prevAngle (public)
 
+    // Camo blocks (Copycats+/Extra/Aero, FramedBlocks, Create copycats): no BER - they render
+    // via the block model + the block-entity's NeoForge model data, so BBS's model-data-less
+    // static mesh shows them empty. We draw the model with model data ourselves (reflective,
+    // since the NeoForge model-data API is not on our Fabric compile classpath).
+    private static boolean camoReflectTried;
+    private static Class<?> modelDataClass;          // net.neoforged.neoforge.client.model.data.ModelData
+    private static Method mGetModelData;             // BlockEntity.getModelData() -> ModelData
+    private static Method mRenderSingleBlockNF;      // BlockRenderDispatcher.renderSingleBlock(state,ps,buf,light,overlay,ModelData,RenderType)
+    private static final java.util.Set<String> CAMO_NS =
+            java.util.Set.of("copycats", "extra_copycats", "aerocopycats", "framedblocks", "create");
+
     private static long lastDiagMs;
     private static long lastErrMs;
 
@@ -135,6 +146,7 @@ public final class KineticReplayRenderer {
         StructureNbtStore.Parsed builtFrom;
         VirtualStructureLevel virtual;
         final List<Placed> placed = new ArrayList<>();
+        final List<Placed> camoPlaced = new ArrayList<>(); // Copycats/FramedBlocks (model-data render)
         double pivotX;
         double pivotY;
         double pivotZ;
@@ -147,13 +159,12 @@ public final class KineticReplayRenderer {
      * (BBS has already applied the form's transform). Returns the number drawn.
      */
     public static int renderInFormSpace(PoseStack stack, MultiBufferSource consumers, StructureForm form, float partial, int light) {
-        if (!BridgeConfig.load().experimentalKineticRender()) {
+        boolean kineticOn = BridgeConfig.load().experimentalKineticRender();
+        boolean camoOn = BridgeConfig.load().renderCamoBlocks();
+        if (!kineticOn && !camoOn) {
             return 0;
         }
         initReflection();
-        if (kineticBeClass == null) {
-            return 0;
-        }
 
         Minecraft mc = Minecraft.getInstance();
         ClientLevel client = mc.level;
@@ -172,52 +183,121 @@ public final class KineticReplayRenderer {
         }
 
         Model model = ensureModel(key, form, client);
-        if (model == null || model.placed.isEmpty()) {
+        if (model == null) {
             return 0;
         }
 
-        // Use BBS's computed form light so kinetics match the static hull (day/night),
-        // both for the BER's light param and any light it samples from the level.
+        // Use BBS's computed form light so our blocks match the static hull (day/night).
         model.virtual.setCurrentLight(light);
 
-        BlockEntityRenderDispatcher dispatcher = mc.getBlockEntityRenderDispatcher();
-        double scale = BridgeConfig.load().propellerSpeedScale();
         long gameTime = client.getGameTime();
-
         int drawn = 0;
-        for (Placed p : model.placed) {
-            drivePropeller(p.be, scale, gameTime, partial);
 
-            BlockEntityRenderer<BlockEntity> renderer = dispatcher.getRenderer(p.be);
-            if (renderer == null) {
-                diag("no BlockEntityRenderer for " + p.be.getClass().getName());
-                continue;
+        // Create kinetics (+ optionally any BER block): drawn through their BlockEntityRenderer.
+        if (kineticOn && kineticBeClass != null && !model.placed.isEmpty()) {
+            BlockEntityRenderDispatcher dispatcher = mc.getBlockEntityRenderDispatcher();
+            double scale = BridgeConfig.load().propellerSpeedScale();
+            for (Placed p : model.placed) {
+                drivePropeller(p.be, scale, gameTime, partial);
+                BlockEntityRenderer<BlockEntity> renderer = dispatcher.getRenderer(p.be);
+                if (renderer == null) {
+                    diag("no BlockEntityRenderer for " + p.be.getClass().getName());
+                    continue;
+                }
+                // Isolated PoseStack so a foreign/buggy BER that leaks a push can NEVER unbalance
+                // the shared world PoseStack ("Pose stack not empty" frame crash).
+                try {
+                    PoseStack isolated = copyStack(stack);
+                    isolated.translate(p.pos.getX() - model.pivotX, p.pos.getY() - model.pivotY, p.pos.getZ() - model.pivotZ);
+                    renderer.render(p.be, partial, isolated, consumers, light, OverlayTexture.NO_OVERLAY);
+                    drawn++;
+                } catch (Throwable t) {
+                    diag("render failed for " + p.be.getClass().getSimpleName() + ": " + t);
+                }
             }
+        }
 
-            // Render each BE into an ISOLATED PoseStack copied from the current transform, so a
-            // foreign/buggy BER that leaks a push (e.g. throws mid-render after pushing, common
-            // when third-party BERs run in our virtual-level context) can NEVER unbalance the
-            // shared world PoseStack - that would crash the whole frame with "Pose stack not
-            // empty". Critical now that renderAllBlockEntities draws arbitrary third-party BERs.
-            try {
-                PoseStack isolated = new PoseStack();
-                isolated.last().pose().set(stack.last().pose());
-                isolated.last().normal().set(stack.last().normal());
-                // Same per-block centering BBS uses: (localPos - pivot).
-                isolated.translate(p.pos.getX() - model.pivotX, p.pos.getY() - model.pivotY, p.pos.getZ() - model.pivotZ);
-                renderer.render(p.be, partial, isolated, consumers, light, OverlayTexture.NO_OVERLAY);
-                drawn++;
-            } catch (Throwable t) {
-                diag("render failed for " + p.be.getClass().getSimpleName() + ": " + t);
-            }
+        // Camo blocks (Copycats/FramedBlocks): draw the block model with the BE's model data.
+        if (camoOn && !model.camoPlaced.isEmpty()) {
+            drawn += renderCamo(stack, consumers, model, light);
         }
 
         long now = System.currentTimeMillis();
         if (drawn > 0 && now - lastDiagMs > 1000L) {
             lastDiagMs = now;
-            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] kinetic render: {} BE(s) for '{}'", drawn, key);
+            AeronauticsCmlBridge.LOGGER.info("[aeronauticscml] form render: {} dynamic block(s) for '{}'", drawn, key);
         }
         return drawn;
+    }
+
+    /** A fresh PoseStack carrying the current transform, so foreign renderers can't touch the shared one. */
+    private static PoseStack copyStack(PoseStack src) {
+        PoseStack out = new PoseStack();
+        out.last().pose().set(src.last().pose());
+        out.last().normal().set(src.last().normal());
+        return out;
+    }
+
+    /**
+     * Draw camo blocks (Copycats/FramedBlocks) via their block model + the block-entity's
+     * NeoForge model data (reflective). BBS renders them empty (no model data), so this is what
+     * makes the camo material show, while keeping the block's shape. renderType=null -> all layers.
+     */
+    private static int renderCamo(PoseStack stack, MultiBufferSource consumers, Model model, int light) {
+        initCamoReflection();
+        if (mRenderSingleBlockNF == null || mGetModelData == null) {
+            return 0;
+        }
+        net.minecraft.client.renderer.block.BlockRenderDispatcher blockRenderer = Minecraft.getInstance().getBlockRenderer();
+        int drawn = 0;
+        for (Placed p : model.camoPlaced) {
+            try {
+                Object md = mGetModelData.invoke(p.be);
+                if (md == null) {
+                    continue;
+                }
+                PoseStack isolated = copyStack(stack);
+                isolated.translate(p.pos.getX() - model.pivotX, p.pos.getY() - model.pivotY, p.pos.getZ() - model.pivotZ);
+                mRenderSingleBlockNF.invoke(blockRenderer, p.be.getBlockState(), isolated, consumers,
+                        light, OverlayTexture.NO_OVERLAY, md, null);
+                drawn++;
+            } catch (Throwable t) {
+                diag("camo render failed for " + p.be.getClass().getSimpleName() + ": " + t);
+            }
+        }
+        return drawn;
+    }
+
+    private static void initCamoReflection() {
+        if (camoReflectTried) {
+            return;
+        }
+        camoReflectTried = true;
+        try {
+            modelDataClass = Class.forName("net.neoforged.neoforge.client.model.data.ModelData");
+            mGetModelData = BlockEntity.class.getMethod("getModelData");
+            mRenderSingleBlockNF = net.minecraft.client.renderer.block.BlockRenderDispatcher.class.getMethod(
+                    "renderSingleBlock",
+                    BlockState.class,
+                    PoseStack.class,
+                    MultiBufferSource.class,
+                    int.class, int.class,
+                    modelDataClass,
+                    net.minecraft.client.renderer.RenderType.class);
+        } catch (Throwable t) {
+            modelDataClass = null;
+            mGetModelData = null;
+            mRenderSingleBlockNF = null;
+            AeronauticsCmlBridge.LOGGER.warn("[aeronauticscml] camo block render unavailable (NeoForge model-data API not found): {}", t.toString());
+        }
+    }
+
+    private static boolean isCamoBlock(BlockState state) {
+        try {
+            return CAMO_NS.contains(net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock()).getNamespace());
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**
@@ -296,6 +376,7 @@ public final class KineticReplayRenderer {
         BlockEntityRenderDispatcher beDispatcher = Minecraft.getInstance().getBlockEntityRenderDispatcher();
         int kineticCount = 0;
         int propellerCount = 0;
+        int camoCount = 0;
         int beWithNbt = 0;
         for (StructureNbtStore.BlockEntry e : parsed.blocks) {
             if (e.beNbt == null) {
@@ -303,23 +384,28 @@ public final class KineticReplayRenderer {
             }
             beWithNbt++;
             try {
+                boolean camo = isCamoBlock(e.state); // Copycats/FramedBlocks - rendered via model data
                 BlockEntity be = BlockEntity.loadStatic(e.pos, e.state, e.beNbt, registries);
                 if (be == null) {
                     continue;
                 }
-                boolean kinetic = kineticBeClass.isInstance(be);
-                if (!kinetic && !allBEs) {
-                    continue; // by default only Create kinetics (shafts/cogs/gearboxes + propellers)
+                boolean kinetic = kineticBeClass != null && kineticBeClass.isInstance(be);
+                boolean wantBER = kinetic || allBEs;
+                if (!wantBER && !camo) {
+                    continue;
                 }
                 be.setLevel(virtual);
-                if (!kinetic && beDispatcher.getRenderer(be) == null) {
-                    continue; // non-kinetic BE with nothing to draw
-                }
                 beMap.put(e.pos, be);
-                m.placed.add(new Placed(e.pos, be));
-                kineticCount++;
-                if (propellerBeClass != null && propellerBeClass.isInstance(be)) {
-                    propellerCount++;
+                if (camo) {
+                    m.camoPlaced.add(new Placed(e.pos, be));
+                    camoCount++;
+                }
+                if (wantBER && (kinetic || beDispatcher.getRenderer(be) != null)) {
+                    m.placed.add(new Placed(e.pos, be));
+                    kineticCount++;
+                    if (propellerBeClass != null && propellerBeClass.isInstance(be)) {
+                        propellerCount++;
+                    }
                 }
             } catch (Throwable ignored) {
                 // skip this BE
@@ -328,8 +414,8 @@ public final class KineticReplayRenderer {
 
         MODELS.put(key, m);
         AeronauticsCmlBridge.LOGGER.info(
-                "[aeronauticscml] Built kinetic model '{}': {} kinetic BEs ({} propellers) of {} block-entities / {} blocks",
-                key, kineticCount, propellerCount, beWithNbt, parsed.blocks.size());
+                "[aeronauticscml] Built render model '{}': {} kinetic BEs ({} propellers), {} camo blocks, of {} BEs / {} blocks",
+                key, kineticCount, propellerCount, camoCount, beWithNbt, parsed.blocks.size());
         return m;
     }
 }
