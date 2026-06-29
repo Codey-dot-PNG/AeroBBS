@@ -154,6 +154,7 @@ public final class RealCmlRecorder implements ICmlRecorder {
     /** First ship recorded this session - fallback owner for ropes we can't attribute. */
     private UUID primaryShipId;
     private static java.lang.reflect.Field ropeSubLevelField;
+    private static java.lang.reflect.Field ropeStartAttachField;
 
     /**
      * Serialized side-file form, one file per ship uuid: relativeTick -> ropes (absolute
@@ -168,6 +169,8 @@ public final class RealCmlRecorder implements ICmlRecorder {
     static final class RopeSnap {
         double radius;
         double[] points;
+        /** Rigid start-attachment (winch/block) tie point in the ship's form-local frame, or null. */
+        double[] startLocal;
     }
 
     private Film film;
@@ -358,13 +361,22 @@ public final class RealCmlRecorder implements ICmlRecorder {
                     snap.radius = rope.getCollisionRadius();
                     snap.points = arr;
 
-                    RopeFile rf = ropeFilesPerShip.computeIfAbsent(owner, k -> new RopeFile());
-                    rf.ticks.computeIfAbsent(tickKey, k -> new ArrayList<>()).add(snap);
                     // Compute the owner ship's anchor pose LIVE for this tick (ropes can be
                     // sampled on ticks where recordFrame didn't run); fall back to the last
                     // frame's stashed pose.
                     double[] pose = computeAnchorPoseNow(owner);
                     if (pose == null) pose = anchorPoseThisTick.get(owner);
+
+                    // The rope's start is rigidly tied to a block on the owner ship (winch, etc.).
+                    // Record that rigid tie point in the ship's form-local frame so playback can
+                    // pin the anchored end to the block (rigid, tracks the hull exactly) instead
+                    // of the slightly-drifting recorded physics point.
+                    if (pose != null) {
+                        snap.startLocal = startAttachmentLocal(rope, pose);
+                    }
+
+                    RopeFile rf = ropeFilesPerShip.computeIfAbsent(owner, k -> new RopeFile());
+                    rf.ticks.computeIfAbsent(tickKey, k -> new ArrayList<>()).add(snap);
                     if (pose != null) rf.poses.put(tickKey, pose);
                     any = true;
                 }
@@ -412,6 +424,30 @@ public final class RealCmlRecorder implements ICmlRecorder {
         } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    /**
+     * The rope's rigid start tie point (Sable's {@code startAttachmentLocation}) expressed in the
+     * owner ship's form-local frame, using the given center-bottom anchor pose
+     * {@code [x,y,z,qx,qy,qz,qw]}. Because the tie point is rigidly fixed to the block, this is
+     * constant across ticks (the ship rotation cancels), so pinning the rope's end to it on
+     * playback keeps it glued to the block. Null if unavailable.
+     */
+    private static double[] startAttachmentLocal(RopePhysicsObject rope, double[] pose) {
+        try {
+            if (ropeStartAttachField == null) {
+                ropeStartAttachField = RopePhysicsObject.class.getDeclaredField("startAttachmentLocation");
+                ropeStartAttachField.setAccessible(true);
+            }
+            Object loc = ropeStartAttachField.get(rope);
+            if (!(loc instanceof Vector3dc v)) return null;
+            // form-local = inverse(anchorRot) * (attach - anchorPos)
+            Vector3d rel = new Vector3d(v.x() - pose[0], v.y() - pose[1], v.z() - pose[2]);
+            new Quaterniond(pose[3], pose[4], pose[5], pose[6]).normalize().conjugate().transform(rel);
+            return new double[]{rel.x, rel.y, rel.z};
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     /**

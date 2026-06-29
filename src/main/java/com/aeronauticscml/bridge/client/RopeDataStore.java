@@ -36,6 +36,8 @@ public final class RopeDataStore {
     public static final class RopeSnap {
         public double radius;
         public double[] points; // flat absolute world [x0,y0,z0, x1,y1,z1, ...]
+        /** Rigid start-attachment (winch/block) tie point in the ship's form-local frame, or null. */
+        public double[] startLocal;
     }
 
     /**

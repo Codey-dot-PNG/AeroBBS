@@ -60,17 +60,19 @@ public final class RopeReplayRenderer {
 
         int count = 0;
         for (int r = 0; r < fr.ropes0.size(); r++) {
-            double[] a = fr.ropes0.get(r).points;
+            RopeDataStore.RopeSnap s0 = fr.ropes0.get(r);
+            double[] a = s0.points;
             if (a == null || a.length < 6) {
                 continue;
             }
-            float radius = (float) Math.max(0.04, Math.min(0.5, fr.ropes0.get(r).radius > 0 ? fr.ropes0.get(r).radius : 0.08));
+            float radius = (float) Math.max(0.04, Math.min(0.5, s0.radius > 0 ? s0.radius : 0.08));
+            RopeDataStore.RopeSnap s1 = (canBlend && r < fr.ropes1.size()) ? fr.ropes1.get(r) : null;
 
             // The matching next-tick polyline, only if it lines up (same point count + the
             // first node didn't teleport in form-local space).
             double[] b = null;
-            if (canBlend && r < fr.ropes1.size()) {
-                double[] cand = fr.ropes1.get(r).points;
+            if (s1 != null) {
+                double[] cand = s1.points;
                 if (cand != null && cand.length == a.length) {
                     Vector3f l0 = local(invRot0, a[0] - ax0, a[1] - ay0, a[2] - az0);
                     Vector3f l1 = local(invRot1, cand[0] - ax1, cand[1] - ay1, cand[2] - az1);
@@ -80,7 +82,13 @@ public final class RopeReplayRenderer {
                 }
             }
 
-            Vector3f prev = blendLocal(invRot0, a, ax0, ay0, az0, invRot1, b, ax1, ay1, az1, 0, alpha);
+            // Anchored start: pin the rope's first node to the rigid block tie point (form-local),
+            // so it stays glued to its block (winch) instead of the slightly-drifting recorded
+            // physics point. Falls back to the recorded point if no tie point was captured.
+            Vector3f prev = startPin(s0, s1, alpha);
+            if (prev == null) {
+                prev = blendLocal(invRot0, a, ax0, ay0, az0, invRot1, b, ax1, ay1, az1, 0, alpha);
+            }
             RopeMesh.node(stack, vc, prev, light);
             for (int i = 3; i + 2 < a.length; i += 3) {
                 Vector3f cur = blendLocal(invRot0, a, ax0, ay0, az0, invRot1, b, ax1, ay1, az1, i, alpha);
@@ -91,6 +99,19 @@ public final class RopeReplayRenderer {
             count++;
         }
         return count;
+    }
+
+    /** The rigid form-local start tie point (interpolated between samples), or null if not recorded. */
+    private static Vector3f startPin(RopeDataStore.RopeSnap s0, RopeDataStore.RopeSnap s1, float alpha) {
+        if (s0 == null || s0.startLocal == null || s0.startLocal.length < 3) {
+            return null;
+        }
+        Vector3f l0 = new Vector3f((float) s0.startLocal[0], (float) s0.startLocal[1], (float) s0.startLocal[2]);
+        if (s1 != null && s1.startLocal != null && s1.startLocal.length >= 3) {
+            Vector3f l1 = new Vector3f((float) s1.startLocal[0], (float) s1.startLocal[1], (float) s1.startLocal[2]);
+            return l0.lerp(l1, alpha);
+        }
+        return l0;
     }
 
     /** Form-local point at index {@code i}, blended toward the next sample when available. */
