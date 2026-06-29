@@ -4,6 +4,7 @@ import com.aeronauticscml.bridge.client.KineticReplayRenderer;
 import com.aeronauticscml.bridge.client.RopeReplayRenderer;
 import com.aeronauticscml.bridge.mod.AeronauticsCmlBridge;
 
+import com.mojang.blaze3d.vertex.ByteBufferBuilder;
 import com.mojang.blaze3d.vertex.PoseStack;
 
 import mchorse.bbs_mod.forms.forms.StructureForm;
@@ -33,6 +34,22 @@ import java.lang.reflect.Field;
 public class AeroStructureFormRenderer extends StructureFormRenderer {
     private static Field stackField;
 
+    /**
+     * Our OWN immediate buffer source - NOT Minecraft's shared one. The BBS editor renders
+     * the 3D viewport as a UI element, batching into the shared bufferSource that GuiGraphics
+     * also uses for panels/tooltips; calling endBatch() on it from inside render3D flushed
+     * the UI's pending geometry at the wrong time (the "UI messes up on hover" glitch). A
+     * dedicated buffer keeps our flush isolated. Lazily created on the render thread.
+     */
+    private static MultiBufferSource.BufferSource ourBuffers;
+
+    private static MultiBufferSource.BufferSource buffers() {
+        if (ourBuffers == null) {
+            ourBuffers = MultiBufferSource.immediate(new ByteBufferBuilder(2048));
+        }
+        return ourBuffers;
+    }
+
     public AeroStructureFormRenderer(StructureForm form) {
         super(form);
     }
@@ -55,7 +72,7 @@ public class AeroStructureFormRenderer extends StructureFormRenderer {
             if (stack == null) {
                 return;
             }
-            MultiBufferSource.BufferSource buffers = Minecraft.getInstance().renderBuffers().bufferSource();
+            MultiBufferSource.BufferSource buffers = buffers();
             float partial = Minecraft.getInstance().getTimer().getGameTimeDeltaPartialTick(false);
             // BBS's per-form light (block<<4 | sky<<20), already day/night-aware - plain
             // int field, no reflection needed.
